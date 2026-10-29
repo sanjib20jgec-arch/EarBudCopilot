@@ -1,42 +1,87 @@
 # Earbud Ambient AI Copilot (Native Android - Kotlin)
 
-A persistent background Android application in Kotlin (Min SDK 26, Target/Compile SDK 35) that continuously listens to ambient code-mixed Bengali and English (**Banglish**) conversations—even when the screen is off/locked—and discreetly whispers single-sentence answers to factual questions directly into your connected earphones.
+A background Android app (min SDK 26, target/compile SDK 35) that listens to ambient code-mixed
+Bengali/English ("Banglish") conversation, decides whether a factual question was asked, and
+whispers a one-sentence answer into the connected earbuds.
+
+> **What it actually does (be aware before you install it):** the app records ambient audio
+> continuously while listening and uploads **each detected utterance** (up to 10 s of surrounding
+> conversation) to a cloud speech-to-text provider. It sends the resulting transcript to a cloud LLM
+> and speaks the answer with the on-device Android TTS engine. There is no on-device speech
+> recognition, so audio leaves the phone.
 
 ---
 
-## Architecture & Core Components
+## Pipeline
 
-1. **`AndroidManifest.xml` (Android 14 / SDK 34+ Strict Compliance)**
-   - Declares `RECORD_AUDIO`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`, `WAKE_LOCK`, `INTERNET`, `MODIFY_AUDIO_SETTINGS`, `BLUETOOTH_CONNECT`, and `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`.
-   - Registers `AmbientListeningService` with `android:foregroundServiceType="microphone"`.
+```
+microphone -> VAD -> WAV chunk -> STT (Groq Whisper / Deepgram) -> LLM (Gemini / Groq) -> TTS -> earbuds
+```
 
-2. **`AmbientListeningService.kt` (Persistent Foreground Service + WakeLock)**
-   - Runs as an ongoing foreground microphone service with `PowerManager.PARTIAL_WAKE_LOCK` (`EarbudAmbientCopilot::AmbientMicWakeLock`) so the CPU never enters deep sleep while the phone screen is locked.
-   - Orchestrates the asynchronous pipeline: `AudioCaptureManager` -> `SttRepository` -> `AiBrainRepository` -> `EarbudTtsManager`.
-   - Automatically pauses microphone capture while `EarbudTtsManager` is whispering so the assistant never triggers on its own voice.
+1. **`AmbientListeningService`** – foreground service with `foregroundServiceType="microphone"` and a
+   `PARTIAL_WAKE_LOCK`. Owns the pipeline and a **single sequential consumer** (`Channel`) so two
+   utterances can never overlap.
+2. **`AudioCaptureManager`** – 16 kHz / 16-bit / mono `AudioRecord` (`VOICE_RECOGNITION`), 32 ms
+   frames, 384 ms pre-roll, 800 ms silence tail, 0.65 s minimum and 10 s maximum utterance,
+   **2-of-3 frame vote** for VAD hysteresis.
+3. **`SileroVadDetector`** – uses `silero_vad.onnx` from assets when present, otherwise an
+   RMS + zero-crossing acoustic detector.
+4. **`SttRepository`** – Groq Whisper (`whisper-large-v3-turbo` → `whisper-large-v3`) or Deepgram
+   Nova-2, with **cross-provider fallback** and one retry on 429/5xx.
+5. **`AiBrainRepository`** – Gemini `generateContent` or Groq chat completions with model discovery
+   and fallback. Returns a typed `BrainDecision`: `Answer`, `Ignored` (the model really said
+   `[IGNORE]`) or `Failed` (HTTP, auth, quota, empty, truncated or safety-blocked). **A failed or
+   empty response is never reported as `[IGNORE]`.**
+6. **`EarbudTtsManager`** – process-wide singleton `TextToSpeech`, Bengali/English voice selection,
+   `USAGE_MEDIA`, audio focus, wired/A2DP/SCO/BLE/hearing-aid detection, init retry with backoff.
+7. **`BootResumeReceiver`** – after a reboot it posts a one-tap "resume listening" notification
+   (Android 14+ forbids starting a microphone foreground service from the background).
 
-3. **`AudioCaptureManager.kt` + `SileroVadDetector.kt` + `WavEncoder.kt`**
-   - Captures 16kHz, 16-bit PCM Mono audio via `AudioRecord` (`VOICE_RECOGNITION` source).
-   - **Hybrid VAD**: Automatically loads `silero_vad.onnx` via `com.microsoft.onnxruntime:onnxruntime-android` if placed in `app/src/main/assets/silero_vad.onnx`, and seamlessly falls back to a real-time acoustic RMS + Zero-Crossing Rate (ZCR) voice detector out of the box.
-   - Maintains a **384ms pre-roll ring buffer** so initial consonants aren't clipped, accumulates active speech (up to 10s max chunk), and finalizes the chunk when silence exceeds **800ms**, encoding a RIFF WAVE file in-memory (`WavEncoder.kt`).
+## Diagnostics
 
-4. **`SttRepository.kt` (Banglish Speech-to-Text)**
-   - Supports **Groq Whisper (`whisper-large-v3`)** via multipart upload with a code-mixed Bengali/English prompt hint (`কলকাতা থেকে দিঘার দূরত্ব কত? Who is the CEO of Google?`) for sub-second Banglish transcription.
-   - Supports **Deepgram Nova-2 (`nova-2`)** as a toggleable alternative.
+The app has an in-app activity log with these tags:
 
-5. **`AiBrainRepository.kt` (Intent & Question Filter)**
-   - Supports **Google Gemini 2.0 Flash** (`gemini-2.0-flash`) and **Groq Llama 3.3 70B** (`llama-3.3-70b-versatile`).
-   - Enforces the exact Banglish system prompt: outputs `[IGNORE]` for social/personal remarks (`চা খাবি?`, `তুই কেমন আছিস?`) and outputs a crisp, 1-sentence factual answer (max 12–15 words) in the same language mix when an objective question is detected.
+| Tag | Meaning |
+|---|---|
+| `VAD` | an utterance chunk was captured / queued |
+| `STT` | transcript (`Heard: "..."`) or "too short" |
+| `STT_ERR` / `LLM_ERR` | the stage failed - the message names the cause |
+| `FILTER` | the model deliberately classified the speech as non-factual |
+| `ANSWER` | an answer was generated (highlighted) |
+| `TTS` | spoken / blocked (no earphones) / engine not ready |
+| `CONFIG` | the pipeline refused to start because a key is missing |
 
-6. **`EarbudTtsManager.kt` (Earphone-Only Whisper Output)**
-   - Monitors connected audio outputs via `AudioManager.registerAudioDeviceCallback` (`TYPE_WIRED_HEADSET`, `TYPE_WIRED_HEADPHONES`, `TYPE_BLUETOOTH_A2DP`, `TYPE_BLE_HEADSET`, `TYPE_BLUETOOTH_SCO`, `TYPE_USB_HEADSET`).
-   - Automatically switches between Bengali (`bn_IN`) and English (`en_IN`) TTS voices based on script detection and blocks loudspeaker playback when strict privacy mode is enabled.
+The **Run Diagnostics** button reports TTS readiness, earphone detection and whether each provider
+key authenticates. Pipeline stage colours: blue = running, yellow = speech, green = speaking,
+grey = filtered, red = error.
 
----
+## Build
 
-## How to Build & Run in Android Studio
+```bash
+gradle assembleDebug
+```
 
-1. Extract `EarbudAmbientCopilot_AndroidProject.zip` and open the `EarbudAmbientCopilot` folder in **Android Studio Ladybug (2024.2.1) or newer**.
-2. Let Gradle sync and download dependencies (SDK 35, Jetpack Compose, OkHttp, ONNX Runtime).
-3. *(Optional)* If you want neural Silero VAD in addition to the built-in RMS+ZCR VAD, place `silero_vad.onnx` inside `app/src/main/assets/silero_vad.onnx`.
-4. Connect your Android device (Android 8.0+ / API 26–35), run the app, enter your **Groq API Key** and/or **Gemini API Key**, connect your earbuds, and tap **START**.
+CI (`.github/workflows/main.yml`) builds on every push and runs the JVM unit tests
+(`app/src/test`) before packaging. Without signing secrets it produces a **debug-signed** APK; because
+the CI debug keystore is regenerated on every run, installing an update over an older build fails
+until you uninstall, which also erases the stored API keys. To get stable, updatable builds, add
+these repository secrets:
+
+| Secret | Meaning |
+|---|---|
+| `RELEASE_KEYSTORE_BASE64` | base64 of your `.jks` (`base64 -w0 release.jks`) |
+| `RELEASE_STORE_PASSWORD` | keystore password |
+| `RELEASE_KEY_ALIAS` | key alias |
+| `RELEASE_KEY_PASSWORD` | key password |
+
+When they are present the workflow builds `assembleRelease` signed with your key; otherwise it falls
+back to a debug build. Locally you can put the same values in `keystore.properties` (git-ignored) or
+export them as environment variables.
+
+## Security notes
+
+- API keys live in `EncryptedSharedPreferences` (AES256-GCM, Keystore-backed) and are migrated from
+  the old plaintext file on first launch. They are never displayed again after saving and never
+  carried in UI state.
+- Gemini authentication uses the `x-goog-api-key` header (not a URL query parameter).
+- Audio and transcripts are **not** written to disk or to logcat; the activity log is memory-only.

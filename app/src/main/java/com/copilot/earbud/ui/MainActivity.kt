@@ -388,6 +388,15 @@ fun CopilotControlScreen(
                 Text("Run Diagnostics (TTS / earphones / API keys)", fontSize = 12.sp)
             }
 
+            Text(
+                text = "Privacy: each detected utterance (up to 10 s of ambient audio) is uploaded " +
+                    "to Groq or Deepgram for transcription, and the transcript is sent to Gemini or " +
+                    "Groq to generate the answer. Nothing is written to disk on the phone and API " +
+                    "keys are stored encrypted.",
+                fontSize = 10.sp,
+                color = Color(0xFF64748B)
+            )
+
             // 4. Real-Time Pipeline Status Logs
             LogsPanel(
                 logs = state.logs,
