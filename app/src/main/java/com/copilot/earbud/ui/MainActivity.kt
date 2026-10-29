@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -35,8 +36,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -676,6 +679,25 @@ private fun LogsPanelContent(
     onClearLogs: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+
+    // Copy/share the whole log as plain text, oldest line first so it reads like a timeline.
+    // Device details are included because most "it lags / it is silent" reports depend on them.
+    val exportLog: () -> String = {
+        buildString {
+            appendLine("Earbud Ambient Copilot - activity log (${logs.size} lines)")
+            appendLine(
+                "Device: ${Build.MANUFACTURER} ${Build.MODEL}, " +
+                    "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
+            )
+            appendLine("---")
+            logs.asReversed().forEach { entry ->
+                appendLine("[${entry.timestamp}] [${entry.tag}] ${entry.message}")
+            }
+        }
+    }
+
     // CopilotStateBus already hands us the newest entry first, but a LazyColumn anchors itself to
     // the item it is currently showing: every new line used to push the visible content down, so the
     // latest line silently slid off the top and had to be scrolled back into view. These two effects
@@ -727,6 +749,40 @@ private fun LogsPanelContent(
                             fontWeight = FontWeight.Medium
                         )
                     }
+                }
+                IconButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(exportLog()))
+                        Toast.makeText(context, "Activity log copied", Toast.LENGTH_SHORT).show()
+                    },
+                    enabled = logs.isNotEmpty(),
+                    modifier = Modifier.size(34.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentCopy,
+                        contentDescription = "Copy the whole activity log",
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+                IconButton(
+                    onClick = {
+                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_SUBJECT, "Earbud Ambient Copilot activity log")
+                            putExtra(Intent.EXTRA_TEXT, exportLog())
+                        }
+                        runCatching {
+                            context.startActivity(Intent.createChooser(shareIntent, "Share activity log"))
+                        }
+                    },
+                    enabled = logs.isNotEmpty(),
+                    modifier = Modifier.size(34.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Share,
+                        contentDescription = "Share the whole activity log",
+                        modifier = Modifier.size(16.dp)
+                    )
                 }
                 TextButton(onClick = onClearLogs) {
                     Text("Clear", fontSize = 11.sp)
