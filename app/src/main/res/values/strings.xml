@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Earbud Ambient Copilot</string>
+    <string name="notification_channel_name">Ambient Copilot Listening Service</string>
+    <string name="notification_channel_desc">Monitors ambient Banglish conversations for factual questions</string>
+</resources>

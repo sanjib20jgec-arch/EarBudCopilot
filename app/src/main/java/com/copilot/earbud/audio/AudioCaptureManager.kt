@@ -1,0 +1,193 @@
+package com.copilot.earbud.audio
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlin.math.max
+
+/**
+ * Continuously records 16kHz 16-bit Mono PCM audio from the microphone.
+ * Uses a pre-roll ring buffer (400ms) + speech accumulator (2s to 12s max) + 800ms silence tail detector
+ * to slice natural utterances and dispatch in-memory WAV chunks to the STT worker.
+ */
+class AudioCaptureManager(
+    context: Context,
+    private val scope: CoroutineScope,
+    initialRmsThreshold: Float,
+    private val onRmsUpdate: (Float) -> Unit,
+    private val onSpeechStateChanged: (Boolean) -> Unit,
+    private val onUtteranceCaptured: suspend (ByteArray, Float) -> Unit,
+    private val onError: (String) -> Unit
+) {
+    companion object {
+        const val SAMPLE_RATE = 16000
+        private const val FRAME_SAMPLES = 512 // 32ms per frame at 16kHz
+        private const val PRE_ROLL_FRAMES = 12 // ~384ms pre-roll before speech trigger
+        private const val SILENCE_TAIL_MS = 800L // 800ms of silence finalizes chunk
+        private const val MIN_SPEECH_DURATION_MS = 650L // Ignore tiny clicks/coughs < 650ms
+        private const val MAX_SPEECH_DURATION_MS = 10000L // Force-dispatch chunk at 10 seconds
+    }
+
+    private val vadDetector = SileroVadDetector(context, initialRmsThreshold)
+    private var audioRecord: AudioRecord? = null
+    private var captureJob: Job? = null
+
+    @Volatile
+    var isPausedForTts: Boolean = false
+
+    fun setVadThreshold(threshold: Float) {
+        vadDetector.rmsThreshold = threshold
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startCapture() {
+        if (captureJob?.isActive == true) return
+
+        val minBufSize = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBufSize <= 0) {
+            onError("AudioRecord hardware initialization failed (invalid buffer size: $minBufSize)")
+            return
+        }
+
+        val bufferSizeInBytes = max(minBufSize * 2, FRAME_SAMPLES * 2 * 10)
+        val recorder = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSizeInBytes
+            )
+        } catch (e: Exception) {
+            onError("Failed to initialize AudioRecord: ${e.message}")
+            return
+        }
+
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            onError("Microphone AudioRecord state not initialized.")
+            recorder.release()
+            return
+        }
+
+        audioRecord = recorder
+        recorder.startRecording()
+
+        captureJob = scope.launch(Dispatchers.IO) {
+            val frameBuffer = ShortArray(FRAME_SAMPLES)
+            val preRollQueue = ArrayDeque<ShortArray>(PRE_ROLL_FRAMES)
+            val activeSpeechPcm = ArrayList<Short>(SAMPLE_RATE * 6)
+
+            var isCurrentlySpeaking = false
+            var speechStartTimestampMs = 0L
+            var lastVoiceTimestampMs = 0L
+            var uiRmsThrottleCounter = 0
+
+            try {
+                while (isActive) {
+                    val readCount = recorder.read(frameBuffer, 0, FRAME_SAMPLES)
+                    if (readCount <= 0) continue
+
+                    // Mute mic capture while TTS is whispering to prevent self-triggering
+                    if (isPausedForTts) {
+                        if (isCurrentlySpeaking) {
+                            isCurrentlySpeaking = false
+                            activeSpeechPcm.clear()
+                            onSpeechStateChanged(false)
+                        }
+                        continue
+                    }
+
+                    val frameCopy = frameBuffer.copyOf(readCount)
+                    val (isSpeech, rms) = vadDetector.evaluateFrame(frameCopy, readCount)
+
+                    if (++uiRmsThrottleCounter % 3 == 0) {
+                        onRmsUpdate(rms)
+                    }
+
+                    val now = System.currentTimeMillis()
+
+                    if (isSpeech) {
+                        if (!isCurrentlySpeaking) {
+                            isCurrentlySpeaking = true
+                            speechStartTimestampMs = now
+                            onSpeechStateChanged(true)
+
+                            // Prepend pre-roll frames so the first consonant of a Banglish word isn't clipped
+                            activeSpeechPcm.clear()
+                            for (preFrame in preRollQueue) {
+                                for (s in preFrame) activeSpeechPcm.add(s)
+                            }
+                            preRollQueue.clear()
+                        }
+                        lastVoiceTimestampMs = now
+                        for (s in frameCopy) activeSpeechPcm.add(s)
+
+                        // Force-finalize if continuous speech reaches max window (10s)
+                        if (now - speechStartTimestampMs >= MAX_SPEECH_DURATION_MS) {
+                            finalizeAndDispatch(activeSpeechPcm, now - speechStartTimestampMs)
+                            isCurrentlySpeaking = false
+                            onSpeechStateChanged(false)
+                        }
+                    } else {
+                        if (isCurrentlySpeaking) {
+                            for (s in frameCopy) activeSpeechPcm.add(s)
+                            val silenceElapsed = now - lastVoiceTimestampMs
+                            if (silenceElapsed >= SILENCE_TAIL_MS) {
+                                val totalSpeechDuration = lastVoiceTimestampMs - speechStartTimestampMs
+                                if (totalSpeechDuration >= MIN_SPEECH_DURATION_MS) {
+                                    finalizeAndDispatch(activeSpeechPcm, totalSpeechDuration)
+                                } else {
+                                    activeSpeechPcm.clear()
+                                }
+                                isCurrentlySpeaking = false
+                                onSpeechStateChanged(false)
+                            }
+                        } else {
+                            if (preRollQueue.size >= PRE_ROLL_FRAMES) {
+                                preRollQueue.removeFirst()
+                            }
+                            preRollQueue.addLast(frameCopy)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                onError("Audio capture loop error: ${e.message}")
+            } finally {
+                runCatching {
+                    recorder.stop()
+                    recorder.release()
+                }
+            }
+        }
+    }
+
+    private suspend fun finalizeAndDispatch(pcmList: ArrayList<Short>, durationMs: Long) {
+        if (pcmList.isEmpty()) return
+        val shorts = ShortArray(pcmList.size)
+        for (i in pcmList.indices) {
+            shorts[i] = pcmList[i]
+        }
+        pcmList.clear()
+        val wavBytes = WavEncoder.encodePcm16MonoToWav(shorts, SAMPLE_RATE)
+        val durationSec = durationMs / 1000f
+        onUtteranceCaptured(wavBytes, durationSec)
+    }
+
+    fun stopCapture() {
+        captureJob?.cancel()
+        captureJob = null
+        audioRecord = null
+        vadDetector.close()
+    }
+}
