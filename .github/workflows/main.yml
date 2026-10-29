@@ -22,17 +22,55 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Build Debug APK
+      # Optional stable signing. Without these repository secrets the build falls back to the
+      # (ephemeral) debug keystore, which changes on every run and forces an uninstall to update.
+      # Required secrets for a proper release build:
+      #   RELEASE_KEYSTORE_BASE64, RELEASE_STORE_PASSWORD, RELEASE_KEY_ALIAS, RELEASE_KEY_PASSWORD
+      - name: Decode release keystore (optional)
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
         run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ]; then
+            echo "Release keystore secret found."
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$GITHUB_WORKSPACE/release.jks"
+            echo "RELEASE_KEYSTORE_FILE=$GITHUB_WORKSPACE/release.jks" >> "$GITHUB_ENV"
+          else
+            echo "::notice::No RELEASE_KEYSTORE_BASE64 secret - building a debug-signed APK."
+          fi
+
+      - name: Build APK
+        env:
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -e
           if ls *.zip 1> /dev/null 2>&1; then
             unzip -q -o "*.zip"
           fi
           BUILD_FILE=$(find . -maxdepth 3 -name "settings.gradle.kts" | head -n 1)
           PROJECT_DIR=$(dirname "$BUILD_FILE")
           cd "$PROJECT_DIR"
-          gradle assembleDebug --no-daemon --stacktrace
+
+          if [ -d app/src/test ]; then
+            echo "Running JVM unit tests"
+            gradle testDebugUnitTest --no-daemon --stacktrace
+          fi
+
+          if [ -n "$RELEASE_KEYSTORE_FILE" ] && [ -n "$RELEASE_STORE_PASSWORD" ] \
+             && [ -n "$RELEASE_KEY_ALIAS" ] && [ -n "$RELEASE_KEY_PASSWORD" ]; then
+            echo "Building signed release APK (stable signature)"
+            gradle assembleRelease --no-daemon --stacktrace
+            APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          else
+            echo "Building debug APK"
+            gradle assembleDebug --no-daemon --stacktrace
+            APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          fi
+
           mkdir -p "$GITHUB_WORKSPACE/apk_out"
-          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/apk_out/EarbudAmbientCopilot.apk"
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/apk_out/EarbudAmbientCopilot.apk"
+          ls -l "$GITHUB_WORKSPACE/apk_out/EarbudAmbientCopilot.apk"
 
       - name: Upload Ready-to-Install APK
         uses: actions/upload-artifact@v4

@@ -8,10 +8,13 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import com.copilot.earbud.domain.model.EarphoneConnectionState
 import com.copilot.earbud.domain.model.TtsOutcome
+import com.copilot.earbud.service.CopilotStateBus
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.Locale
 import java.util.UUID
@@ -19,24 +22,39 @@ import kotlin.coroutines.resume
 
 /**
  * Manages Android Native TextToSpeech and routes audio output to connected earphones:
- * - TYPE_WIRED_HEADSET
- * - TYPE_WIRED_HEADPHONES
- * - TYPE_BLUETOOTH_A2DP
- * - TYPE_BLE_HEADSET / TYPE_BLE_SPEAKER
- * - TYPE_BLUETOOTH_SCO
- * - TYPE_USB_HEADSET
+ * - TYPE_WIRED_HEADSET / TYPE_WIRED_HEADPHONES / TYPE_USB_HEADSET
+ * - TYPE_BLUETOOTH_A2DP / TYPE_BLUETOOTH_SCO
+ * - TYPE_BLE_HEADSET / TYPE_BLE_SPEAKER / TYPE_BLE_BROADCAST (API 31+)
+ * - TYPE_HEARING_AID (API 31+)
  *
- * Uses STREAM_MUSIC / USAGE_MEDIA so that Bluetooth A2DP & SCO earbuds always play clearly.
+ * Process-wide singleton: the foreground service and the UI share ONE engine binding. Two parallel
+ * `TextToSpeech` instances used to fight over locale, audio attributes and device callbacks.
+ * Initialization is retried with backoff, because a single failed `onInit` used to leave the app
+ * permanently unable to speak while still reporting itself as listening.
  */
-class EarbudTtsManager(
-    private val context: Context,
-    private val onEarphoneConnectionChanged: (EarphoneConnectionState) -> Unit,
-    private val onLog: (String) -> Unit
-) : TextToSpeech.OnInitListener {
+class EarbudTtsManager private constructor(context: Context) : TextToSpeech.OnInitListener {
 
-    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    companion object {
+        private const val MAX_INIT_ATTEMPTS = 3
+        private const val INIT_RETRY_DELAY_MS = 2000L
+
+        @Volatile
+        private var instance: EarbudTtsManager? = null
+
+        fun get(context: Context): EarbudTtsManager =
+            instance ?: synchronized(this) {
+                instance ?: EarbudTtsManager(context.applicationContext).also { instance = it }
+            }
+    }
+
+    private val appContext: Context = context.applicationContext
+    private val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
+    private var initAttempts = 0
+    private var initInFlight = false
 
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
@@ -49,14 +67,35 @@ class EarbudTtsManager(
     }
 
     init {
-        tts = TextToSpeech(context.applicationContext, this)
+        startEngine()
         audioManager.registerAudioDeviceCallback(audioDeviceCallback, null)
         refreshEarphoneStatus()
     }
 
+    val isReady: Boolean
+        get() = isTtsReady
+
+    private fun log(message: String) {
+        CopilotStateBus.log("TTS", message)
+    }
+
+    private fun startEngine() {
+        if (initInFlight) return
+        initInFlight = true
+        runCatching { tts?.shutdown() }
+        tts = TextToSpeech(appContext, this)
+    }
+
     override fun onInit(status: Int) {
+        initInFlight = false
         if (status == TextToSpeech.SUCCESS) {
-            val engine = tts ?: return
+            val engine = tts
+            if (engine == null) {
+                isTtsReady = false
+                scheduleRetry("TTS engine handle was lost")
+                return
+            }
+
             val bnInLocale = Locale("bn", "IN")
             val bnBdLocale = Locale("bn", "BD")
             val enInLocale = Locale("en", "IN")
@@ -64,15 +103,15 @@ class EarbudTtsManager(
             when {
                 isVoiceAvailable(engine, bnInLocale) -> {
                     engine.language = bnInLocale
-                    onLog("TTS ready: Bengali (India) voice active.")
+                    log("TTS ready: Bengali (India) voice active.")
                 }
                 isVoiceAvailable(engine, bnBdLocale) -> {
                     engine.language = bnBdLocale
-                    onLog("TTS ready: Bengali (Bangladesh) voice active.")
+                    log("TTS ready: Bengali (Bangladesh) voice active.")
                 }
                 else -> {
                     engine.language = enInLocale
-                    onLog("TTS ready: English (India) voice active.")
+                    log("TTS ready: English (India) voice active (no Bengali voice found).")
                 }
             }
 
@@ -86,12 +125,35 @@ class EarbudTtsManager(
                     .build()
             )
             isTtsReady = true
+            initAttempts = 0
         } else {
-            onLog(
-                "TTS engine failed to initialize (status=$status). " +
-                    "Enable a speech engine and voice data in Android Settings > Text-to-speech output."
-            )
+            isTtsReady = false
+            scheduleRetry("TTS engine failed to initialize (status=$status)")
         }
+    }
+
+    private fun scheduleRetry(reason: String) {
+        initAttempts++
+        if (initAttempts > MAX_INIT_ATTEMPTS) {
+            log(
+                "$reason. Gave up after $MAX_INIT_ATTEMPTS attempts — enable a speech engine and voice " +
+                    "data in Android Settings > Text-to-speech output."
+            )
+            return
+        }
+        log("$reason. Retry $initAttempts/$MAX_INIT_ATTEMPTS in ${INIT_RETRY_DELAY_MS / 1000}s.")
+        mainHandler.postDelayed({ startEngine() }, INIT_RETRY_DELAY_MS)
+    }
+
+    /** Best-effort recovery hook used right before speaking. */
+    fun ensureReady(): Boolean {
+        if (isTtsReady) return true
+        if (!initInFlight && initAttempts <= MAX_INIT_ATTEMPTS) {
+            log("TTS not ready; retrying engine initialization before speaking.")
+            initAttempts = 0
+            startEngine()
+        }
+        return isTtsReady
     }
 
     private fun isVoiceAvailable(engine: TextToSpeech, locale: Locale): Boolean {
@@ -101,31 +163,32 @@ class EarbudTtsManager(
 
     fun findConnectedEarphoneDevice(): AudioDeviceInfo? {
         val outputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        // Prefer A2DP / Wired / BLE media output first, then SCO
+        // Prefer A2DP / wired / BLE media output first, then everything else
         val sorted = outputDevices.sortedBy { dev ->
             when (dev.type) {
                 AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 0
-                AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_USB_HEADSET -> 1
+                AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                AudioDeviceInfo.TYPE_USB_HEADSET -> 1
                 else -> 2
             }
         }
-        return sorted.firstOrNull { device ->
-            when (device.type) {
-                AudioDeviceInfo.TYPE_WIRED_HEADSET,
-                AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
-                AudioDeviceInfo.TYPE_USB_HEADSET -> true
-                else -> {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                            device.type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
-                            device.type == AudioDeviceInfo.TYPE_BLE_BROADCAST
-                    } else {
-                        false
-                    }
-                }
-            }
+        return sorted.firstOrNull { device -> isHeadphoneType(device.type) }
+    }
+
+    private fun isHeadphoneType(type: Int): Boolean = when (type) {
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_USB_HEADSET -> true
+        else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+                type == AudioDeviceInfo.TYPE_BLE_BROADCAST ||
+                type == AudioDeviceInfo.TYPE_HEARING_AID
+        } else {
+            false
         }
     }
 
@@ -146,25 +209,28 @@ class EarbudTtsManager(
                 deviceTypeDescription = "Loudspeaker Blocked for Privacy"
             )
         }
-        onEarphoneConnectionChanged(state)
+        CopilotStateBus.updateEarphoneState(state)
         return state
     }
 
     suspend fun whisperToEarbuds(text: String, requireEarphones: Boolean = true): TtsOutcome {
         if (text.isBlank()) {
-            onLog("Nothing to speak: the answer text was empty.")
+            log("Nothing to speak: the answer text was empty.")
             return TtsOutcome.ENGINE_ERROR
         }
 
         val engine = tts
         if (!isTtsReady || engine == null) {
-            onLog("TTS engine is not ready yet; cannot whisper. Check Android Settings > Text-to-speech output.")
-            return TtsOutcome.NOT_READY
+            if (!ensureReady()) {
+                log("TTS engine is not ready yet; cannot whisper. Check Android Settings > Text-to-speech output.")
+                return TtsOutcome.NOT_READY
+            }
         }
+        val readyEngine = tts ?: return TtsOutcome.NOT_READY
 
         val targetEarphone = findConnectedEarphoneDevice()
         if (requireEarphones && targetEarphone == null) {
-            onLog("Whisper blocked: No wired or Bluetooth earphones connected.")
+            log("Whisper blocked: No wired or Bluetooth earphones connected.")
             return TtsOutcome.NO_EARPHONES
         }
 
@@ -174,19 +240,19 @@ class EarbudTtsManager(
             val bnIn = Locale("bn", "IN")
             val bnBd = Locale("bn", "BD")
             when {
-                isVoiceAvailable(engine, bnIn) -> engine.language = bnIn
-                isVoiceAvailable(engine, bnBd) -> engine.language = bnBd
+                isVoiceAvailable(readyEngine, bnIn) -> readyEngine.language = bnIn
+                isVoiceAvailable(readyEngine, bnBd) -> readyEngine.language = bnBd
                 // No Bengali voice on this device: the engine may read Bengali script with a
                 // non-Bengali voice and stay silent. Say so explicitly instead of failing quietly.
-                else -> onLog(
+                else -> log(
                     "Bengali voice data is missing on this device; the Bengali answer may be silent or " +
                         "mispronounced. Install a Bengali voice in Android Settings > Text-to-speech output."
                 )
             }
         } else {
             val enIn = Locale("en", "IN")
-            if (isVoiceAvailable(engine, enIn)) {
-                engine.language = enIn
+            if (isVoiceAvailable(readyEngine, enIn)) {
+                readyEngine.language = enIn
             }
         }
 
@@ -195,7 +261,7 @@ class EarbudTtsManager(
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .setLegacyStreamType(AudioManager.STREAM_MUSIC)
             .build()
-        engine.setAudioAttributes(audioAttrs)
+        readyEngine.setAudioAttributes(audioAttrs)
 
         val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
             .setAudioAttributes(audioAttrs)
@@ -211,9 +277,9 @@ class EarbudTtsManager(
                     ?.takeIf { it.isNotBlank() }
                     ?: "default audio output"
 
-                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                readyEngine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(id: String?) {
-                        onLog("Speaking via $deviceLabel ...")
+                        log("Speaking via $deviceLabel ...")
                     }
 
                     override fun onDone(id: String?) {
@@ -225,14 +291,14 @@ class EarbudTtsManager(
                     @Deprecated("Deprecated in Java")
                     override fun onError(id: String?) {
                         if (id == utteranceId && continuation.isActive) {
-                            onLog("TTS playback error.")
+                            log("TTS playback error.")
                             continuation.resume(TtsOutcome.ENGINE_ERROR)
                         }
                     }
 
                     override fun onError(id: String?, errorCode: Int) {
                         if (id == utteranceId && continuation.isActive) {
-                            onLog("TTS playback error (code=$errorCode).")
+                            log("TTS playback error (code=$errorCode).")
                             continuation.resume(TtsOutcome.ENGINE_ERROR)
                         }
                     }
@@ -243,9 +309,9 @@ class EarbudTtsManager(
                     putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
                 }
 
-                val speakResult = engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+                val speakResult = readyEngine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
                 if (speakResult == TextToSpeech.ERROR && continuation.isActive) {
-                    onLog("TTS engine.speak returned ERROR.")
+                    log("TTS engine.speak returned ERROR.")
                     continuation.resume(TtsOutcome.ENGINE_ERROR)
                 }
             }
@@ -260,18 +326,29 @@ class EarbudTtsManager(
         AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth A2DP Earbuds"
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth Headset (SCO)"
         AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C Headset"
-        else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && type == AudioDeviceInfo.TYPE_BLE_HEADSET) {
-            "BLE Audio Earbuds"
+        else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            when (type) {
+                AudioDeviceInfo.TYPE_BLE_HEADSET -> "BLE Audio Earbuds"
+                AudioDeviceInfo.TYPE_BLE_SPEAKER -> "BLE Speaker"
+                AudioDeviceInfo.TYPE_HEARING_AID -> "Hearing Aid"
+                else -> "Audio Headset"
+            }
         } else {
             "Audio Headset"
         }
     }
 
+    /** Called when the whole app goes away; the singleton is kept for the process lifetime otherwise. */
     fun shutdown() {
         runCatching { audioManager.unregisterAudioDeviceCallback(audioDeviceCallback) }
         runCatching {
             tts?.stop()
             tts?.shutdown()
+        }
+        tts = null
+        isTtsReady = false
+        synchronized(Companion::class.java) {
+            if (instance === this) instance = null
         }
     }
 }

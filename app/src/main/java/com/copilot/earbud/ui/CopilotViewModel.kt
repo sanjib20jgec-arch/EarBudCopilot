@@ -29,7 +29,13 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
 
     private val prefs = SettingsPreferences(application)
     private val aiBrainRepository = AiBrainRepository()
-    private var previewTtsManager: EarbudTtsManager? = null
+
+    /**
+     * Shared process-wide TTS engine. Created eagerly so the engine is initializing while the user
+     * is still entering keys, and shared with [AmbientListeningService] so there is exactly one
+     * `TextToSpeech` binding in the process.
+     */
+    private val ttsManager: EarbudTtsManager = EarbudTtsManager.get(application)
 
     private val _sttProvider = MutableStateFlow(prefs.sttProvider)
     private val _llmProvider = MutableStateFlow(prefs.llmProvider)
@@ -88,16 +94,6 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = CopilotUiState()
     )
-
-    init {
-        previewTtsManager = EarbudTtsManager(
-            context = application,
-            onEarphoneConnectionChanged = { state ->
-                CopilotStateBus.updateEarphoneState(state)
-            },
-            onLog = { }
-        )
-    }
 
     fun updateGroqApiKey(key: String) {
         prefs.groqApiKey = key
@@ -197,7 +193,7 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
                 }
                 is BrainDecision.Answer -> {
                     CopilotStateBus.log("ANSWER", decision.text, isHighlight = true)
-                    val outcome = previewTtsManager?.whisperToEarbuds(
+                    val outcome = ttsManager.whisperToEarbuds(
                         text = decision.text,
                         requireEarphones = prefs.requireEarphonesForTts
                     )
@@ -208,7 +204,6 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
                             TtsOutcome.NO_EARPHONES -> "Test answer NOT spoken: no earphones detected."
                             TtsOutcome.NOT_READY -> "Test answer NOT spoken: TTS engine not ready."
                             TtsOutcome.ENGINE_ERROR -> "Test answer NOT spoken: TTS engine error."
-                            null -> "Test answer NOT spoken: TTS manager unavailable."
                         },
                         isError = outcome != TtsOutcome.SPOKEN
                     )
@@ -231,7 +226,8 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
     }
 
     override fun onCleared() {
-        previewTtsManager?.shutdown()
+        // The TTS engine is a process-wide singleton shared with the foreground service, so it is
+        // deliberately not shut down when this ViewModel is cleared.
         super.onCleared()
     }
 

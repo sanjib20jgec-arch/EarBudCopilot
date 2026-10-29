@@ -58,15 +58,8 @@ class AmbientListeningService : Service() {
         super.onCreate()
         prefs = SettingsPreferences(this)
 
-        earbudTtsManager = EarbudTtsManager(
-            context = this,
-            onEarphoneConnectionChanged = { state ->
-                CopilotStateBus.updateEarphoneState(state)
-            },
-            onLog = { msg ->
-                CopilotStateBus.log("TTS", msg)
-            }
-        )
+        // Process-wide singleton: the UI's "Quick Test" button shares this exact engine.
+        earbudTtsManager = EarbudTtsManager.get(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -323,7 +316,8 @@ class AmbientListeningService : Service() {
 
     override fun onDestroy() {
         stopAmbientCopilot()
-        earbudTtsManager?.shutdown()
+        // The TTS engine is a process-wide singleton and is intentionally NOT shut down here:
+        // the UI's Quick Test button may still be using it.
         serviceScope.cancel()
         super.onDestroy()
     }
