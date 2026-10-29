@@ -50,7 +50,10 @@ microphone -> VAD -> WAV chunk -> STT (Groq Whisper / Deepgram) -> LLM (Gemini /
 
 ## Diagnostics
 
-The app has an in-app activity log with these tags:
+The app has an in-app activity log with these tags. Newest entries are on top and the panel stays
+pinned to the newest line, so no scrolling is needed while the copilot is running; if you scroll
+back to read history, a **↑ Newest** button (with the number of lines that arrived meanwhile) jumps
+back up:
 
 | Tag | Meaning |
 |---|---|

@@ -18,6 +18,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -27,6 +28,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -39,6 +42,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.launch
 import com.copilot.earbud.domain.model.CopilotUiState
 import com.copilot.earbud.domain.model.LlmProvider
 import com.copilot.earbud.domain.model.LogEntry
@@ -607,6 +611,27 @@ private fun LogsPanel(
     onClearLogs: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    // CopilotStateBus already hands us the newest entry first, but a LazyColumn anchors itself to
+    // the item it is currently showing: every new line used to push the visible content down, so the
+    // latest line silently slid off the top and had to be scrolled back into view. These two effects
+    // keep the newest line pinned at the top unless the user deliberately scrolled down to read
+    // history - and offer a one-tap jump back when new lines arrive meanwhile.
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val newestId = logs.firstOrNull()?.id
+    val isFollowingNewest by remember {
+        derivedStateOf { listState.firstVisibleItemIndex <= 1 }
+    }
+    var unseenEntries by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(newestId) {
+        if (newestId == null) return@LaunchedEffect
+        if (isFollowingNewest) listState.scrollToItem(0) else unseenEntries += 1
+    }
+    LaunchedEffect(isFollowingNewest) {
+        if (isFollowingNewest) unseenEntries = 0
+    }
+
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
         shape = RoundedCornerShape(14.dp),
@@ -624,8 +649,20 @@ private fun LogsPanel(
                     text = "Real-Time Copilot Activity Log",
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF94A3B8)
+                    color = Color(0xFF94A3B8),
+                    modifier = Modifier.weight(1f)
                 )
+                if (!isFollowingNewest) {
+                    TextButton(
+                        onClick = { scope.launch { listState.animateScrollToItem(0) } }
+                    ) {
+                        Text(
+                            text = if (unseenEntries > 0) "\u2191 Newest ($unseenEntries)" else "\u2191 Newest",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
                 TextButton(onClick = onClearLogs) {
                     Text("Clear", fontSize = 11.sp)
                 }
@@ -641,6 +678,7 @@ private fun LogsPanel(
                 }
             } else {
                 LazyColumn(
+                    state = listState,
                     modifier = Modifier.fillMaxSize(),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
