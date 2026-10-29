@@ -87,9 +87,12 @@ class SileroVadDetector(
             }
         }
 
-        // Lightweight acoustic energy + Zero-Crossing Rate human speech filter
+        // Lightweight acoustic energy + Zero-Crossing Rate human speech filter.
+        // The band is deliberately wide: the previous 0.015 lower bound rejected deep male voices
+        // (a ~100 Hz fundamental over a 32 ms frame yields ~0.0125), which silently dropped
+        // utterances before they ever reached transcription. RMS still gates absolute level.
         val zcrRatio = zeroCrossings.toFloat() / length.toFloat()
-        val isPlausibleVoiceFrequency = zcrRatio in 0.015f..0.45f
+        val isPlausibleVoiceFrequency = zcrRatio in 0.006f..0.55f
         val isSpeech = rms >= rmsThreshold && isPlausibleVoiceFrequency
         return isSpeech to rms
     }

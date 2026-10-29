@@ -1,12 +1,14 @@
 package com.copilot.earbud.data.remote
 
 import com.copilot.earbud.domain.model.SttProvider
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
@@ -40,11 +42,68 @@ class SttRepository {
         groqApiKey: String,
         deepgramApiKey: String
     ): Result<String> = withContext(Dispatchers.IO) {
-        runCatching {
-            when (provider) {
-                SttProvider.GROQ_WHISPER -> transcribeWithGroqWhisper(wavBytes, groqApiKey)
-                SttProvider.DEEPGRAM_NOVA2 -> transcribeWithDeepgram(wavBytes, deepgramApiKey)
+        try {
+            Result.success(transcribeWithFallback(wavBytes, provider, groqApiKey, deepgramApiKey))
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
+    }
+
+    /**
+     * Tries the selected provider first, then any other provider that has a key. This is what makes
+     * "only a Groq key" or "only a Deepgram key" a working configuration instead of a silent
+     * listening session that never answers.
+     */
+    private fun transcribeWithFallback(
+        wavBytes: ByteArray,
+        provider: SttProvider,
+        groqApiKey: String,
+        deepgramApiKey: String
+    ): String {
+        val order = LinkedHashSet<SttProvider>()
+        order.add(provider)
+        order.addAll(SttProvider.entries)
+
+        val errors = mutableListOf<String>()
+        for (candidate in order) {
+            val key = when (candidate) {
+                SttProvider.GROQ_WHISPER -> groqApiKey
+                SttProvider.DEEPGRAM_NOVA2 -> deepgramApiKey
             }
+            if (key.isBlank()) {
+                errors += "${candidate.displayName}: no API key"
+                continue
+            }
+            val transcript = try {
+                when (candidate) {
+                    SttProvider.GROQ_WHISPER -> transcribeWithGroqWhisper(wavBytes, key)
+                    SttProvider.DEEPGRAM_NOVA2 -> transcribeWithDeepgram(wavBytes, key)
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (t: Throwable) {
+                errors += (t.message ?: "${candidate.displayName}: failed")
+                continue
+            }
+            return transcript
+        }
+
+        throw IllegalStateException("Speech-to-text failed. " + errors.joinToString(" | "))
+    }
+
+    /** One retry for throttling / transient server errors (a 429 used to end the utterance silently). */
+    private fun executeWithRetry(request: Request, maxRetries: Int = 1): Response {
+        var attempt = 0
+        while (true) {
+            val response = httpClient.newCall(request).execute()
+            val retryable = response.code == 429 || response.code == 500 ||
+                response.code == 502 || response.code == 503 || response.code == 504
+            if (!retryable || attempt >= maxRetries) return response
+            response.close()
+            attempt++
+            runCatching { Thread.sleep(700L * attempt) }
         }
     }
 
@@ -76,7 +135,7 @@ class SttRepository {
                 .post(multipartBody)
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
+            executeWithRetry(request).use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (response.isSuccessful) {
                     resolvedWhisperModel = modelId
@@ -99,7 +158,7 @@ class SttRepository {
             .post(requestBody)
             .build()
 
-        httpClient.newCall(request).execute().use { response ->
+        executeWithRetry(request).use { response ->
             val bodyStr = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 throw IllegalStateException("Deepgram STT HTTP ${response.code}: ${bodyStr.take(180)}")

@@ -39,9 +39,11 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
 
     private val _sttProvider = MutableStateFlow(prefs.sttProvider)
     private val _llmProvider = MutableStateFlow(prefs.llmProvider)
-    private val _groqKey = MutableStateFlow(prefs.groqApiKey)
-    private val _deepgramKey = MutableStateFlow(prefs.deepgramApiKey)
-    private val _geminiKey = MutableStateFlow(prefs.geminiApiKey)
+
+    // Only "is a key stored?" ever leaves this class - key material is never exposed to the UI layer.
+    private val _groqKeySet = MutableStateFlow(prefs.hasGroqKey)
+    private val _deepgramKeySet = MutableStateFlow(prefs.hasDeepgramKey)
+    private val _geminiKeySet = MutableStateFlow(prefs.hasGeminiKey)
     private val _vadThreshold = MutableStateFlow(prefs.vadThresholdRms)
     private val _requireEarphones = MutableStateFlow(prefs.requireEarphonesForTts)
     private val _batteryOptIgnored = MutableStateFlow(checkBatteryOptimizationIgnored())
@@ -60,9 +62,9 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
             currentRmsDb = rms,
             sttProvider = _sttProvider.value,
             llmProvider = _llmProvider.value,
-            groqApiKey = _groqKey.value,
-            deepgramApiKey = _deepgramKey.value,
-            geminiApiKey = _geminiKey.value,
+            groqKeySet = _groqKeySet.value,
+            deepgramKeySet = _deepgramKeySet.value,
+            geminiKeySet = _geminiKeySet.value,
             vadThresholdRms = _vadThreshold.value,
             requireEarphonesForTts = _requireEarphones.value,
             isBatteryOptimizationIgnored = _batteryOptIgnored.value,
@@ -72,9 +74,9 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
         combine(
             _sttProvider,
             _llmProvider,
-            _groqKey,
-            _deepgramKey,
-            _geminiKey
+            _groqKeySet,
+            _deepgramKeySet,
+            _geminiKeySet
         ) { stt, llm, groq, dg, gemini ->
              Tuple5(stt, llm, groq, dg, gemini)
         }
@@ -82,9 +84,9 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
         base.copy(
             sttProvider = keys.a,
             llmProvider = keys.b,
-            groqApiKey = keys.c,
-            deepgramApiKey = keys.d,
-            geminiApiKey = keys.e,
+            groqKeySet = keys.c,
+            deepgramKeySet = keys.d,
+            geminiKeySet = keys.e,
             vadThresholdRms = _vadThreshold.value,
             requireEarphonesForTts = _requireEarphones.value,
             isBatteryOptimizationIgnored = _batteryOptIgnored.value
@@ -97,17 +99,17 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateGroqApiKey(key: String) {
         prefs.groqApiKey = key
-        _groqKey.value = key
+        _groqKeySet.value = prefs.hasGroqKey
     }
 
     fun updateDeepgramApiKey(key: String) {
         prefs.deepgramApiKey = key
-        _deepgramKey.value = key
+        _deepgramKeySet.value = prefs.hasDeepgramKey
     }
 
     fun updateGeminiApiKey(key: String) {
         prefs.geminiApiKey = key
-        _geminiKey.value = key
+        _geminiKeySet.value = prefs.hasGeminiKey
     }
 
     fun selectSttProvider(provider: SttProvider) {
@@ -209,6 +211,43 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
                     )
                 }
             }
+        }
+    }
+
+    /**
+     * Self-check that answers "why is nothing being spoken?" without a PC: reports TTS engine
+     * readiness, earphone detection and whether each provider key actually authenticates.
+     */
+    fun runDiagnostics() {
+        viewModelScope.launch {
+            CopilotStateBus.log("DIAG", "Running diagnostics...")
+
+            CopilotStateBus.log(
+                "DIAG",
+                if (ttsManager.isReady) "TTS: engine ready." else
+                    "TTS: engine NOT ready - check Android Settings > Text-to-speech output (install a Bengali voice for Banglish answers)."
+            )
+
+            val earphones = ttsManager.refreshEarphoneStatus()
+            CopilotStateBus.log(
+                "DIAG",
+                if (earphones.isConnected) {
+                    "Earphones: ${earphones.deviceName} (${earphones.deviceTypeDescription})."
+                } else {
+                    "Earphones: none detected - \"Strict Earbud-Only Whisper\" will block all speech."
+                }
+            )
+
+            val sttKeyStatus = when (prefs.sttProvider) {
+                SttProvider.GROQ_WHISPER -> if (prefs.hasGroqKey) "present" else "MISSING"
+                SttProvider.DEEPGRAM_NOVA2 -> if (prefs.hasDeepgramKey) "present" else "MISSING"
+            }
+            CopilotStateBus.log("DIAG", "Speech-to-text: ${prefs.sttProvider.displayName} key $sttKeyStatus.")
+
+            aiBrainRepository.pingProviders(
+                geminiApiKey = prefs.geminiApiKey,
+                groqApiKey = prefs.groqApiKey
+            ).forEach { line -> CopilotStateBus.log("DIAG", line) }
         }
     }
 

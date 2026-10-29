@@ -80,9 +80,11 @@ data class CopilotUiState(
     val currentRmsDb: Float = 0f,
     val sttProvider: SttProvider = SttProvider.GROQ_WHISPER,
     val llmProvider: LlmProvider = LlmProvider.GEMINI_FLASH,
-    val groqApiKey: String = "",
-    val deepgramApiKey: String = "",
-    val geminiApiKey: String = "",
+
+    // Key material is never carried in UI state; only whether a key is stored.
+    val groqKeySet: Boolean = false,
+    val deepgramKeySet: Boolean = false,
+    val geminiKeySet: Boolean = false,
     val vadThresholdRms: Float = 420f,
     val requireEarphonesForTts: Boolean = true,
     val isBatteryOptimizationIgnored: Boolean = false,

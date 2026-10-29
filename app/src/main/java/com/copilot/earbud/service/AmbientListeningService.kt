@@ -65,7 +65,7 @@ class AmbientListeningService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopAmbientCopilot()
+                stopAmbientCopilot(clearResumeFlag = true)
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -95,15 +95,30 @@ class AmbientListeningService : Service() {
 
         // 1. Promote to Foreground Service with FOREGROUND_SERVICE_TYPE_MICROPHONE (Android 14 / SDK 34+)
         val notification = buildNotification("Listening passively for Banglish questions...")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (t: Throwable) {
+            // On Android 12+ starting a microphone foreground service while the app is in the
+            // background throws. Fail loudly instead of crashing the whole process.
+            CopilotStateBus.log(
+                "SERVICE",
+                "Could not start the microphone foreground service: ${t.message}. " +
+                    "Open the app and press START again, and allow it to ignore battery optimization.",
+                isError = true
             )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+            CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
+            stopSelf()
+            return
         }
+        prefs.resumeAfterBoot = true
 
         // 2. Acquire PARTIAL_WAKE_LOCK so CPU stays awake when screen is locked/off
         acquireWakeLock()
@@ -306,10 +321,13 @@ class AmbientListeningService : Service() {
         manager.notify(NOTIFICATION_ID, buildNotification(contentText))
     }
 
-    private fun stopAmbientCopilot() {
+    private fun stopAmbientCopilot(clearResumeFlag: Boolean = false) {
         audioCaptureManager?.stopCapture()
         audioCaptureManager = null
         releaseWakeLock()
+        // Only an explicit user stop clears the "resume after reboot" intent; being killed by the
+        // system must not, otherwise the copilot would never offer to resume.
+        if (clearResumeFlag) prefs.resumeAfterBoot = false
         CopilotStateBus.setServiceRunning(false)
         CopilotStateBus.log("SERVICE", "Ambient Listening Service stopped.")
     }

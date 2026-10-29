@@ -9,6 +9,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
@@ -98,15 +99,102 @@ Your tasks:
         groqApiKey: String
     ): Result<BrainDecision> = withContext(Dispatchers.IO) {
         try {
-            val call = when (provider) {
-                LlmProvider.GEMINI_FLASH -> queryGeminiWithFallback(transcript, geminiApiKey)
-                LlmProvider.GROQ_LLAMA -> queryGroqWithFallback(transcript, groqApiKey)
+            val preferred = askProvider(provider, transcript, geminiApiKey, groqApiKey)
+            if (preferred !is BrainDecision.Failed) {
+                return@withContext Result.success(preferred)
             }
-            Result.success(classify(call))
+
+            // Cross-provider fallback: a single working key (e.g. only Groq) should still answer.
+            val alternative = alternativeProvider(provider, geminiApiKey, groqApiKey)
+                ?: return@withContext Result.success(preferred)
+
+            val second = askProvider(alternative, transcript, geminiApiKey, groqApiKey)
+            if (second !is BrainDecision.Failed) {
+                return@withContext Result.success(second)
+            }
+
+            Result.success(
+                BrainDecision.Failed(
+                    "${preferred.message} | fallback ${alternative.name}: ${second.message}"
+                )
+            )
         } catch (cancellation: CancellationException) {
             throw cancellation
         } catch (t: Throwable) {
             Result.failure(t)
+        }
+    }
+
+    private fun askProvider(
+        provider: LlmProvider,
+        transcript: String,
+        geminiApiKey: String,
+        groqApiKey: String
+    ): BrainDecision = try {
+        val call = when (provider) {
+            LlmProvider.GEMINI_FLASH -> queryGeminiWithFallback(transcript, geminiApiKey)
+            LlmProvider.GROQ_LLAMA -> queryGroqWithFallback(transcript, groqApiKey)
+        }
+        classify(call)
+    } catch (cancellation: CancellationException) {
+        throw cancellation
+    } catch (t: Throwable) {
+        BrainDecision.Failed("${provider.name}: ${t.message ?: t.toString()}")
+    }
+
+    private fun alternativeProvider(
+        provider: LlmProvider,
+        geminiApiKey: String,
+        groqApiKey: String
+    ): LlmProvider? = when (provider) {
+        LlmProvider.GEMINI_FLASH -> if (groqApiKey.isNotBlank()) LlmProvider.GROQ_LLAMA else null
+        LlmProvider.GROQ_LLAMA -> if (geminiApiKey.isNotBlank()) LlmProvider.GEMINI_FLASH else null
+    }
+
+    /** Cheap credential/connectivity probe used by the in-app diagnostics button. */
+    suspend fun pingProviders(geminiApiKey: String, groqApiKey: String): List<String> =
+        withContext(Dispatchers.IO) {
+            val lines = mutableListOf<String>()
+
+            if (geminiApiKey.isBlank()) {
+                lines += "Gemini: no key stored."
+            } else {
+                val models = fetchAvailableGeminiModels(geminiApiKey)
+                lines += if (models.isEmpty()) {
+                    "Gemini: key rejected or unreachable (no models listed)."
+                } else {
+                    "Gemini: OK - ${models.size} models available (first: ${models.first()})."
+                }
+            }
+
+            if (groqApiKey.isBlank()) {
+                lines += "Groq: no key stored."
+            } else {
+                val models = fetchAvailableGroqModels(groqApiKey)
+                lines += if (models.isEmpty()) {
+                    "Groq: key rejected or unreachable (no models listed)."
+                } else {
+                    "Groq: OK - ${models.size} models available (first: ${models.first()})."
+                }
+            }
+
+            lines
+        }
+
+    /**
+     * One retry for throttling / transient server errors. A single 429 used to silently end the
+     * utterance (the assistant simply stayed quiet).
+     */
+    private fun executeWithRetry(request: Request, maxRetries: Int = 1): Response {
+        var attempt = 0
+        while (true) {
+            val response = httpClient.newCall(request).execute()
+            val retryable = response.code == 429 || response.code == 500 ||
+                response.code == 502 || response.code == 503 || response.code == 504
+            if (!retryable || attempt >= maxRetries) return response
+            response.close()
+            attempt++
+            runCatching { Thread.sleep(700L * attempt) }
         }
     }
 
@@ -248,7 +336,7 @@ Your tasks:
             .build()
 
         return try {
-            httpClient.newCall(request).execute().use { response ->
+            executeWithRetry(request).use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     return ProviderCall.HttpError(
@@ -426,7 +514,7 @@ Your tasks:
             .build()
 
         return try {
-            httpClient.newCall(request).execute().use { response ->
+            executeWithRetry(request).use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     return ProviderCall.HttpError(

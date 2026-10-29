@@ -13,6 +13,7 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Audio Routing & Bluetooth Earbud Detection Permissions -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
@@ -39,6 +40,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Offers a one-tap resume notification after a reboot (a microphone FGS may not be
+             started from the background on Android 14+). -->
+        <receiver
+            android:name=".BootResumeReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
 
         <!-- Persistent Background Ambient Listening Foreground Service -->
         <service
