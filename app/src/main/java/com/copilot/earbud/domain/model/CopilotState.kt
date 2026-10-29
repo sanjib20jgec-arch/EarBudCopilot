@@ -17,7 +17,45 @@ enum class PipelineStage {
     TRANSCRIBING_STT,
     ANALYZING_INTENT,
     WHISPERING_TTS,
+
+    /** The AI brain deliberately decided the transcript is not a factual question (a real `[IGNORE]`). */
+    FILTERED,
+
+    /** An answer was produced but intentionally not spoken (e.g. no earphones + strict privacy mode). */
+    TTS_BLOCKED,
+
+    /** An answer was produced and speech output failed (engine not ready / engine error). */
+    TTS_FAILED,
+
+    /** A stage failed: STT/LLM transport, auth, quota, truncation or blocked response. */
     ERROR
+}
+
+/**
+ * Outcome of the AI brain for one transcript.
+ *
+ * The distinction between [Ignored] and [Failed] is essential: before this existed, an empty,
+ * truncated or safety-blocked provider response was reported as `[IGNORE]` and silently dropped,
+ * which is indistinguishable from a correct "this was not a question" decision.
+ */
+sealed class BrainDecision {
+
+    /** A spoken-worthy answer was generated. */
+    data class Answer(val text: String, val model: String) : BrainDecision()
+
+    /** The provider explicitly classified the transcript as non-factual / conversational. */
+    data class Ignored(val reason: String) : BrainDecision()
+
+    /** No usable answer was produced (HTTP error, auth, quota, empty, truncated or blocked response). */
+    data class Failed(val message: String) : BrainDecision()
+}
+
+/** Result of a text-to-speech attempt, so callers can tell *why* nothing was heard. */
+enum class TtsOutcome {
+    SPOKEN,
+    NOT_READY,
+    NO_EARPHONES,
+    ENGINE_ERROR
 }
 
 data class LogEntry(

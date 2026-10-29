@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import com.copilot.earbud.domain.model.EarphoneConnectionState
+import com.copilot.earbud.domain.model.TtsOutcome
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.Locale
 import java.util.UUID
@@ -86,7 +87,10 @@ class EarbudTtsManager(
             )
             isTtsReady = true
         } else {
-            onLog("TTS Engine failed to initialize (status=$status)")
+            onLog(
+                "TTS engine failed to initialize (status=$status). " +
+                    "Enable a speech engine and voice data in Android Settings > Text-to-speech output."
+            )
         }
     }
 
@@ -146,17 +150,22 @@ class EarbudTtsManager(
         return state
     }
 
-    suspend fun whisperToEarbuds(text: String, requireEarphones: Boolean = true): Boolean {
+    suspend fun whisperToEarbuds(text: String, requireEarphones: Boolean = true): TtsOutcome {
+        if (text.isBlank()) {
+            onLog("Nothing to speak: the answer text was empty.")
+            return TtsOutcome.ENGINE_ERROR
+        }
+
         val engine = tts
         if (!isTtsReady || engine == null) {
-            onLog("TTS not ready yet; cannot whisper.")
-            return false
+            onLog("TTS engine is not ready yet; cannot whisper. Check Android Settings > Text-to-speech output.")
+            return TtsOutcome.NOT_READY
         }
 
         val targetEarphone = findConnectedEarphoneDevice()
         if (requireEarphones && targetEarphone == null) {
             onLog("Whisper blocked: No wired or Bluetooth earphones connected.")
-            return false
+            return TtsOutcome.NO_EARPHONES
         }
 
         // Automatically select Bengali or English locale depending on Unicode script
@@ -167,6 +176,12 @@ class EarbudTtsManager(
             when {
                 isVoiceAvailable(engine, bnIn) -> engine.language = bnIn
                 isVoiceAvailable(engine, bnBd) -> engine.language = bnBd
+                // No Bengali voice on this device: the engine may read Bengali script with a
+                // non-Bengali voice and stay silent. Say so explicitly instead of failing quietly.
+                else -> onLog(
+                    "Bengali voice data is missing on this device; the Bengali answer may be silent or " +
+                        "mispronounced. Install a Bengali voice in Android Settings > Text-to-speech output."
+                )
             }
         } else {
             val enIn = Locale("en", "IN")
@@ -188,16 +203,22 @@ class EarbudTtsManager(
         audioManager.requestAudioFocus(focusRequest)
 
         return try {
-            suspendCancellableCoroutine { continuation ->
+            suspendCancellableCoroutine<TtsOutcome> { continuation ->
                 val utteranceId = UUID.randomUUID().toString()
+                val deviceLabel = targetEarphone
+                    ?.productName
+                    ?.toString()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "default audio output"
+
                 engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(id: String?) {
-                        onLog("Whispering into earbuds now...")
+                        onLog("Speaking via $deviceLabel ...")
                     }
 
                     override fun onDone(id: String?) {
                         if (id == utteranceId && continuation.isActive) {
-                            continuation.resume(true)
+                            continuation.resume(TtsOutcome.SPOKEN)
                         }
                     }
 
@@ -205,14 +226,14 @@ class EarbudTtsManager(
                     override fun onError(id: String?) {
                         if (id == utteranceId && continuation.isActive) {
                             onLog("TTS playback error.")
-                            continuation.resume(false)
+                            continuation.resume(TtsOutcome.ENGINE_ERROR)
                         }
                     }
 
                     override fun onError(id: String?, errorCode: Int) {
                         if (id == utteranceId && continuation.isActive) {
                             onLog("TTS playback error (code=$errorCode).")
-                            continuation.resume(false)
+                            continuation.resume(TtsOutcome.ENGINE_ERROR)
                         }
                     }
                 })
@@ -225,7 +246,7 @@ class EarbudTtsManager(
                 val speakResult = engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
                 if (speakResult == TextToSpeech.ERROR && continuation.isActive) {
                     onLog("TTS engine.speak returned ERROR.")
-                    continuation.resume(false)
+                    continuation.resume(TtsOutcome.ENGINE_ERROR)
                 }
             }
         } finally {

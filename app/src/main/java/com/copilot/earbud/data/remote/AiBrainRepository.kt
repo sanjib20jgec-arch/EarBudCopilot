@@ -1,6 +1,8 @@
 package com.copilot.earbud.data.remote
 
+import com.copilot.earbud.domain.model.BrainDecision
 import com.copilot.earbud.domain.model.LlmProvider
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -14,12 +16,27 @@ import java.util.concurrent.TimeUnit
 /**
  * Evaluates transcribed ambient speech using the strict Banglish Ambient Copilot System Prompt.
  * Automatically discovers and falls back across active Gemini (e.g. gemini-3.0-flash, gemini-2.5-flash)
- * and Groq (e.g. openai/gpt-oss-120b, openai/gpt-oss-20b, meta-llama/llama-4-scout-17b-16e-instruct) models.
+ * and Groq (e.g. openai/gpt-oss-120b, meta-llama/llama-4-scout-17b-16e-instruct) models.
+ *
+ * IMPORTANT: this class never turns a failed/empty/blocked provider response into an `[IGNORE]`
+ * classification. Only text that the model actually returned is classified; everything else is
+ * reported as [BrainDecision.Failed] with a diagnostic reason, so the pipeline can distinguish
+ * "not a question" from "we never got an answer".
  */
 class AiBrainRepository {
 
     companion object {
         const val IGNORE_TOKEN = "[IGNORE]"
+
+        /**
+         * Head-room for one short sentence *plus* any hidden reasoning tokens. Gemini 2.5/3 Flash
+         * count thinking tokens against `maxOutputTokens`; a tight budget made them return an empty
+         * candidate (finishReason=MAX_TOKENS) which used to be misread as "[IGNORE]".
+         */
+        private const val GEMINI_MAX_OUTPUT_TOKENS = 1024
+
+        /** Same idea for Groq: enough for a one-line answer plus reasoning of reasoning models. */
+        private const val GROQ_MAX_TOKENS = 512
 
         private val GROQ_FALLBACK_MODELS = listOf(
             "openai/gpt-oss-120b",
@@ -46,6 +63,22 @@ Your tasks:
         """.trimIndent()
     }
 
+    /**
+     * Raw, unclassified result of a single provider call. Keeping these cases apart is what allows
+     * the pipeline to tell "the model said this is not a question" apart from "the model produced
+     * no text at all" (truncated, blocked, empty, or a transport error).
+     */
+    private sealed class ProviderCall {
+        /** The provider returned real, non-blank text. */
+        data class Text(val model: String, val text: String) : ProviderCall()
+
+        /** HTTP 200, but there is no answer text — truncated, safety-blocked or empty candidate. */
+        data class NonAnswer(val model: String, val reason: String) : ProviderCall()
+
+        /** Non-2xx response or a transport failure. */
+        data class HttpError(val model: String, val message: String) : ProviderCall()
+    }
+
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
@@ -63,23 +96,50 @@ Your tasks:
         provider: LlmProvider,
         geminiApiKey: String,
         groqApiKey: String
-    ): Result<String?> = withContext(Dispatchers.IO) {
-        runCatching {
-            val rawResponse = when (provider) {
+    ): Result<BrainDecision> = withContext(Dispatchers.IO) {
+        try {
+            val call = when (provider) {
                 LlmProvider.GEMINI_FLASH -> queryGeminiWithFallback(transcript, geminiApiKey)
                 LlmProvider.GROQ_LLAMA -> queryGroqWithFallback(transcript, groqApiKey)
-            }.trim()
-
-            if (rawResponse.isEmpty() || rawResponse.contains(IGNORE_TOKEN, ignoreCase = true)) {
-                null
-            } else {
-                rawResponse
             }
+            Result.success(classify(call))
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (t: Throwable) {
+            Result.failure(t)
         }
     }
 
-    private fun queryGeminiWithFallback(transcript: String, apiKey: String): String {
-        require(apiKey.isNotBlank()) { "Gemini API key is missing. Tap the top-right settings icon and enter it." }
+    /**
+     * Maps a provider call onto a decision. A blank / blocked / truncated response is a FAILURE and
+     * is reported as such — it must never be silently downgraded to "not a question".
+     */
+    private fun classify(call: ProviderCall): BrainDecision = when (call) {
+        is ProviderCall.Text -> {
+            val cleaned = stripThinking(call.text).trim()
+            when {
+                cleaned.isEmpty() ->
+                    BrainDecision.Failed("${call.model}: response contained no answer text")
+                cleaned.contains(IGNORE_TOKEN, ignoreCase = true) ->
+                    BrainDecision.Ignored("${call.model} classified the transcript as non-factual / conversational")
+                else ->
+                    BrainDecision.Answer(cleaned, call.model)
+            }
+        }
+
+        is ProviderCall.NonAnswer -> BrainDecision.Failed("${call.model}: ${call.reason}")
+        is ProviderCall.HttpError -> BrainDecision.Failed(call.message)
+    }
+
+    private fun stripThinking(raw: String): String =
+        raw.replace(Regex("<think>[\\s\\S]*?</think>"), "").trim()
+
+    // ---------------------------------------------------------------------------------------------
+    // Gemini
+    // ---------------------------------------------------------------------------------------------
+
+    private fun queryGeminiWithFallback(transcript: String, apiKey: String): ProviderCall {
+        require(apiKey.isNotBlank()) { "Gemini API key is missing. Enter it in API Keys & Pipeline Engine." }
 
         val candidates = LinkedHashSet<String>()
         resolvedGeminiModel?.let { candidates.add(it) }
@@ -87,44 +147,78 @@ Your tasks:
 
         var lastError = ""
         for (modelId in candidates) {
-            val (reply, err) = tryGeminiGenerateContent(transcript, apiKey, modelId)
-            if (reply != null) {
-                resolvedGeminiModel = modelId
-                return reply
-            }
-            lastError = err
-            // If error message explicitly names the replacement model (e.g. "use models/gemini-3.0-flash"), extract & try it immediately!
-            val suggested = Regex("models/(gemini-[a-zA-Z0-9._-]+)").find(err)?.groupValues?.getOrNull(1)
-            if (!suggested.isNullOrBlank() && suggested !in candidates) {
-                val (sReply, sErr) = tryGeminiGenerateContent(transcript, apiKey, suggested)
-                if (sReply != null) {
-                    resolvedGeminiModel = suggested
-                    return sReply
+            when (val call = tryGeminiGenerateContent(transcript, apiKey, modelId)) {
+                is ProviderCall.Text -> {
+                    resolvedGeminiModel = modelId
+                    return call
                 }
-                lastError = sErr
+                // The request itself worked; the model just produced no text. Report it instead of
+                // masking it as "[IGNORE]", and do not burn more latency on other models for it.
+                is ProviderCall.NonAnswer -> return call
+                is ProviderCall.HttpError -> {
+                    lastError = call.message
+                    // If the error explicitly names a replacement model, try it immediately.
+                    val suggested = Regex("models/(gemini-[a-zA-Z0-9._-]+)")
+                        .find(call.message)
+                        ?.groupValues
+                        ?.getOrNull(1)
+                    if (!suggested.isNullOrBlank() && suggested !in candidates) {
+                        when (val retry = tryGeminiGenerateContent(transcript, apiKey, suggested)) {
+                            is ProviderCall.Text -> {
+                                resolvedGeminiModel = suggested
+                                return retry
+                            }
+                            is ProviderCall.NonAnswer -> return retry
+                            is ProviderCall.HttpError -> lastError = retry.message
+                        }
+                    }
+                }
             }
         }
 
-        // Dynamic fallback: query /v1beta/models to find any active flash/pro model supporting generateContent
-        val discovered = fetchAvailableGeminiModels(apiKey)
-        for (modelId in discovered) {
+        // Dynamic fallback: query /v1beta/models to find any active model supporting generateContent.
+        for (modelId in fetchAvailableGeminiModels(apiKey)) {
             if (modelId in candidates) continue
-            val (reply, err) = tryGeminiGenerateContent(transcript, apiKey, modelId)
-            if (reply != null) {
-                resolvedGeminiModel = modelId
-                return reply
+            when (val call = tryGeminiGenerateContent(transcript, apiKey, modelId)) {
+                is ProviderCall.Text -> {
+                    resolvedGeminiModel = modelId
+                    return call
+                }
+                is ProviderCall.NonAnswer -> return call
+                is ProviderCall.HttpError -> lastError = call.message
             }
-            lastError = err
         }
 
-        throw IllegalStateException(lastError)
+        return ProviderCall.HttpError("gemini", lastError.ifBlank { "No Gemini model responded." })
     }
 
     private fun tryGeminiGenerateContent(
         transcript: String,
         apiKey: String,
         modelId: String
-    ): Pair<String?, String> {
+    ): ProviderCall {
+        val withThinkingControl = supportsThinkingControl(modelId)
+        val first = callGemini(transcript, apiKey, modelId, withThinkingControl)
+        // Some older models reject the unknown `thinkingConfig` field with HTTP 400. Retry once
+        // without it rather than failing the whole utterance.
+        if (withThinkingControl &&
+            first is ProviderCall.HttpError &&
+            first.message.contains("HTTP 400") &&
+            first.message.contains("thinking", ignoreCase = true)
+        ) {
+            return callGemini(transcript, apiKey, modelId, false)
+        }
+        return first
+    }
+
+    private fun callGemini(
+        transcript: String,
+        apiKey: String,
+        modelId: String,
+        withThinkingControl: Boolean
+    ): ProviderCall {
+        val cleanModel = modelId.removePrefix("models/")
+
         val payload = JSONObject().apply {
             put("systemInstruction", JSONObject().apply {
                 put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT)))
@@ -137,39 +231,102 @@ Your tasks:
             ))
             put("generationConfig", JSONObject().apply {
                 put("temperature", 0.1)
-                put("maxOutputTokens", 100)
+                put("maxOutputTokens", GEMINI_MAX_OUTPUT_TOKENS)
+                if (withThinkingControl) {
+                    // Thinking is on by default for 2.5/3 Flash and is billed against maxOutputTokens.
+                    // Disabling it keeps a one-line answer from being truncated away entirely.
+                    put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                }
             })
         }
 
-        val cleanModel = modelId.removePrefix("models/")
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=$apiKey"
         val request = Request.Builder()
-            .url(url)
+            .url("https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent")
+            .addHeader("x-goog-api-key", apiKey)
             .addHeader("Content-Type", "application/json")
             .post(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        httpClient.newCall(request).execute().use { response ->
-            val bodyStr = response.body?.string().orEmpty()
-            if (response.isSuccessful) {
-                val json = JSONObject(bodyStr)
-                val text = json.optJSONArray("candidates")
-                    ?.optJSONObject(0)
-                    ?.optJSONObject("content")
-                    ?.optJSONArray("parts")
-                    ?.optJSONObject(0)
-                    ?.optString("text", IGNORE_TOKEN)
-                    ?: IGNORE_TOKEN
-                return text to ""
+        return try {
+            httpClient.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return ProviderCall.HttpError(
+                        cleanModel,
+                        "Gemini ($cleanModel) HTTP ${response.code}: ${bodyStr.take(200)}"
+                    )
+                }
+                parseGeminiBody(cleanModel, bodyStr)
             }
-            return null to "Gemini ($cleanModel) HTTP ${response.code}: ${bodyStr.take(180)}"
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (t: Throwable) {
+            ProviderCall.HttpError(cleanModel, "Gemini ($cleanModel) request failed: ${t.message}")
         }
+    }
+
+    private fun parseGeminiBody(model: String, bodyStr: String): ProviderCall {
+        val json = JSONObject(bodyStr)
+
+        val blockReason = json.optJSONObject("promptFeedback")
+            ?.optString("blockReason")
+            .orEmpty()
+        val usage = json.optJSONObject("usageMetadata")
+        val thoughts = usage?.optInt("thoughtsTokenCount", 0) ?: 0
+
+        val candidate = json.optJSONArray("candidates")?.optJSONObject(0)
+        val finishReason = candidate?.optString("finishReason").orEmpty()
+        val text = candidate
+            ?.optJSONObject("content")
+            ?.optJSONArray("parts")
+            ?.let { parts ->
+                buildString {
+                    for (index in 0 until parts.length()) {
+                        val part = parts.optJSONObject(index) ?: continue
+                        if (part.optBoolean("thought", false)) continue
+                        append(part.optString("text").orEmpty())
+                    }
+                }
+            }
+            .orEmpty()
+            .trim()
+
+        if (text.isNotEmpty()) return ProviderCall.Text(model, text)
+
+        val reason = when {
+            blockReason.isNotBlank() ->
+                "request blocked by the provider (promptFeedback.blockReason=$blockReason)"
+            finishReason == "MAX_TOKENS" ->
+                "response truncated before any answer (finishReason=MAX_TOKENS, " +
+                    "thoughtsTokenCount=$thoughts, maxOutputTokens=$GEMINI_MAX_OUTPUT_TOKENS)"
+            finishReason == "SAFETY" || finishReason == "RECITATION" || finishReason == "PROHIBITED_CONTENT" ->
+                "response withheld by the provider (finishReason=$finishReason)"
+            finishReason.isNotBlank() ->
+                "provider returned no answer text (finishReason=$finishReason, thoughtsTokenCount=$thoughts)"
+            else ->
+                "provider returned an empty response (thoughtsTokenCount=$thoughts)"
+        }
+        return ProviderCall.NonAnswer(model, reason)
+    }
+
+    /**
+     * Whether it is safe/meaningful to send `thinkingConfig` for this model. Older models reject the
+     * field; [tryGeminiGenerateContent] additionally retries without it on HTTP 400.
+     */
+    private fun supportsThinkingControl(modelId: String): Boolean {
+        val id = modelId.removePrefix("models/")
+        return id.contains("2.5") ||
+            id.contains("gemini-3") ||
+            id.contains("gemini-4") ||
+            id.contains("flash-latest") ||
+            id.contains("pro-latest")
     }
 
     private fun fetchAvailableGeminiModels(apiKey: String): List<String> {
         return runCatching {
             val request = Request.Builder()
-                .url("https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey")
+                .url("https://generativelanguage.googleapis.com/v1beta/models")
+                .addHeader("x-goog-api-key", apiKey)
                 .get()
                 .build()
             httpClient.newCall(request).execute().use { response ->
@@ -196,8 +353,12 @@ Your tasks:
         }.getOrDefault(emptyList())
     }
 
-    private fun queryGroqWithFallback(transcript: String, apiKey: String): String {
-        require(apiKey.isNotBlank()) { "Groq API key is missing. Tap the top-right settings icon and enter it." }
+    // ---------------------------------------------------------------------------------------------
+    // Groq
+    // ---------------------------------------------------------------------------------------------
+
+    private fun queryGroqWithFallback(transcript: String, apiKey: String): ProviderCall {
+        require(apiKey.isNotBlank()) { "Groq API key is missing. Enter it in API Keys & Pipeline Engine." }
 
         val candidates = LinkedHashSet<String>()
         resolvedGroqModel?.let { candidates.add(it) }
@@ -205,33 +366,36 @@ Your tasks:
 
         var lastError = ""
         for (modelId in candidates) {
-            val result = tryGroqChatCompletion(transcript, apiKey, modelId)
-            if (result.first != null) {
-                resolvedGroqModel = modelId
-                return result.first!!
+            when (val call = tryGroqChatCompletion(transcript, apiKey, modelId)) {
+                is ProviderCall.Text -> {
+                    resolvedGroqModel = modelId
+                    return call
+                }
+                is ProviderCall.NonAnswer -> return call
+                is ProviderCall.HttpError -> lastError = call.message
             }
-            lastError = result.second
         }
 
-        val discoveredModels = fetchAvailableGroqModels(apiKey)
-        for (modelId in discoveredModels) {
+        for (modelId in fetchAvailableGroqModels(apiKey)) {
             if (modelId in candidates) continue
-            val result = tryGroqChatCompletion(transcript, apiKey, modelId)
-            if (result.first != null) {
-                resolvedGroqModel = modelId
-                return result.first!!
+            when (val call = tryGroqChatCompletion(transcript, apiKey, modelId)) {
+                is ProviderCall.Text -> {
+                    resolvedGroqModel = modelId
+                    return call
+                }
+                is ProviderCall.NonAnswer -> return call
+                is ProviderCall.HttpError -> lastError = call.message
             }
-            lastError = result.second
         }
 
-        throw IllegalStateException(lastError)
+        return ProviderCall.HttpError("groq", lastError.ifBlank { "No Groq model responded." })
     }
 
     private fun tryGroqChatCompletion(
         transcript: String,
         apiKey: String,
         modelId: String
-    ): Pair<String?, String> {
+    ): ProviderCall {
         val messages = JSONArray()
             .put(JSONObject().apply {
                 put("role", "system")
@@ -246,7 +410,12 @@ Your tasks:
             put("model", modelId)
             put("messages", messages)
             put("temperature", 0.1)
-            put("max_tokens", 120)
+            put("max_tokens", GROQ_MAX_TOKENS)
+            if (isReasoningModel(modelId)) {
+                // Reasoning models spend part of the budget on hidden reasoning; keep it low so a
+                // one-line answer is not starved (that previously surfaced as an empty "[IGNORE]").
+                put("reasoning_effort", "low")
+            }
         }
 
         val request = Request.Builder()
@@ -256,21 +425,54 @@ Your tasks:
             .post(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        httpClient.newCall(request).execute().use { response ->
-            val bodyStr = response.body?.string().orEmpty()
-            if (response.isSuccessful) {
-                val json = JSONObject(bodyStr)
-                val text = json.optJSONArray("choices")
-                    ?.optJSONObject(0)
-                    ?.optJSONObject("message")
-                    ?.optString("content", IGNORE_TOKEN)
-                    ?: IGNORE_TOKEN
-                val cleaned = text.replace(Regex("<think>[\\s\\S]*?</think>"), "").trim()
-                return (cleaned.ifEmpty { IGNORE_TOKEN }) to ""
+        return try {
+            httpClient.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return ProviderCall.HttpError(
+                        modelId,
+                        "Groq ($modelId) HTTP ${response.code}: ${bodyStr.take(200)}"
+                    )
+                }
+                parseGroqBody(modelId, bodyStr)
             }
-            val err = "Groq ($modelId) HTTP ${response.code}: ${bodyStr.take(160)}"
-            return null to err
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (t: Throwable) {
+            ProviderCall.HttpError(modelId, "Groq ($modelId) request failed: ${t.message}")
         }
+    }
+
+    private fun isReasoningModel(modelId: String): Boolean {
+        val id = modelId.lowercase()
+        return id.contains("gpt-oss") ||
+            id.contains("qwen3") ||
+            id.contains("deepseek") ||
+            id.contains("reasoning")
+    }
+
+    private fun parseGroqBody(model: String, bodyStr: String): ProviderCall {
+        val json = JSONObject(bodyStr)
+        val choice = json.optJSONArray("choices")?.optJSONObject(0)
+        val finishReason = choice?.optString("finish_reason").orEmpty()
+        val message = choice?.optJSONObject("message")
+        val text = stripThinking(message?.optString("content").orEmpty())
+        val reasoningChars = message?.optString("reasoning").orEmpty().length
+
+        if (text.isNotEmpty()) return ProviderCall.Text(model, text)
+
+        val reason = when {
+            finishReason == "length" ->
+                "response truncated before any answer (finish_reason=length, " +
+                    "max_tokens=$GROQ_MAX_TOKENS, reasoningChars=$reasoningChars)"
+            finishReason.isNotBlank() ->
+                "provider returned no answer text (finish_reason=$finishReason, reasoningChars=$reasoningChars)"
+            reasoningChars > 0 ->
+                "provider returned reasoning only, no answer text (reasoningChars=$reasoningChars)"
+            else ->
+                "provider returned an empty response"
+        }
+        return ProviderCall.NonAnswer(model, reason)
     }
 
     private fun fetchAvailableGroqModels(apiKey: String): List<String> {

@@ -18,8 +18,11 @@ import com.copilot.earbud.audio.EarbudTtsManager
 import com.copilot.earbud.data.local.SettingsPreferences
 import com.copilot.earbud.data.remote.AiBrainRepository
 import com.copilot.earbud.data.remote.SttRepository
+import com.copilot.earbud.domain.model.BrainDecision
 import com.copilot.earbud.domain.model.PipelineStage
+import com.copilot.earbud.domain.model.TtsOutcome
 import com.copilot.earbud.ui.MainActivity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -79,6 +82,15 @@ class AmbientListeningService : Service() {
                 return START_STICKY
             }
             else -> {
+                // Pre-flight: refuse to start a microphone pipeline that cannot possibly answer.
+                // Stopping before startForeground() is safe and avoids a foreground-service timeout.
+                val configIssue = prefs.configIssue()
+                if (configIssue != null) {
+                    CopilotStateBus.log("CONFIG", "Service not started: $configIssue", isError = true)
+                    CopilotStateBus.setPipelineStage(PipelineStage.IDLE)
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 startAmbientCopilot()
                 return START_STICKY
             }
@@ -152,11 +164,12 @@ class AmbientListeningService : Service() {
 
             val transcript = sttResult.getOrElse { err ->
                 CopilotStateBus.log("STT_ERR", err.message ?: "STT failed", isError = true)
-                CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
+                CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
                 return@launch
             }
 
             if (transcript.length < 3) {
+                CopilotStateBus.log("STT", "Ignored: transcript too short (${transcript.length} chars).")
                 CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
                 return@launch
             }
@@ -164,39 +177,80 @@ class AmbientListeningService : Service() {
             CopilotStateBus.log("STT", "Heard: \"$transcript\"")
             CopilotStateBus.setPipelineStage(PipelineStage.ANALYZING_INTENT)
 
-            val llmResult = aiBrainRepository.analyzeTranscript(
+            val decision = aiBrainRepository.analyzeTranscript(
                 transcript = transcript,
                 provider = prefs.llmProvider,
                 geminiApiKey = prefs.geminiApiKey,
                 groqApiKey = prefs.groqApiKey
-            )
-
-            val answer = llmResult.getOrElse { err ->
-                CopilotStateBus.log("LLM_ERR", err.message ?: "LLM analysis failed", isError = true)
-                CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
-                return@launch
+            ).getOrElse { err ->
+                BrainDecision.Failed(err.message ?: "AI brain request failed")
             }
 
-            if (answer == null) {
-                CopilotStateBus.log("BRAIN", "[IGNORE] (Conversational / non-factual remark)")
-                CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
-                return@launch
+            val answer = when (decision) {
+                // A real failure (auth, quota, transport, empty/truncated/blocked response). This is
+                // NOT the same thing as "the model decided this was not a question" and is never
+                // reported as an [IGNORE].
+                is BrainDecision.Failed -> {
+                    CopilotStateBus.log("LLM_ERR", decision.message, isError = true)
+                    CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
+                    return@launch
+                }
+                // The model deliberately classified this as conversational/social.
+                is BrainDecision.Ignored -> {
+                    CopilotStateBus.log("FILTER", decision.reason)
+                    CopilotStateBus.setPipelineStage(PipelineStage.FILTERED)
+                    return@launch
+                }
+                is BrainDecision.Answer -> decision
             }
 
             // Objective question detected! Whisper crisp 1-sentence answer into earphones
-            CopilotStateBus.log("ANSWER", answer, isHighlight = true)
-            updateNotification("Whispered: $answer")
+            CopilotStateBus.log("ANSWER", answer.text, isHighlight = true)
+            updateNotification("Answer ready: ${answer.text}")
 
             CopilotStateBus.setPipelineStage(PipelineStage.WHISPERING_TTS)
             audioCaptureManager?.isPausedForTts = true
-            try {
+            val outcome = try {
                 earbudTtsManager?.whisperToEarbuds(
-                    text = answer,
+                    text = answer.text,
                     requireEarphones = prefs.requireEarphonesForTts
-                )
+                ) ?: TtsOutcome.NOT_READY
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (t: Throwable) {
+                CopilotStateBus.log("TTS_ERR", "Whisper failed: ${t.message}", isError = true)
+                TtsOutcome.ENGINE_ERROR
             } finally {
                 audioCaptureManager?.isPausedForTts = false
-                CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
+            }
+
+            // Report what actually happened instead of silently resetting the stage.
+            when (outcome) {
+                TtsOutcome.SPOKEN -> {
+                    CopilotStateBus.log("TTS", "Answer spoken into the earbuds.")
+                    CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
+                }
+                TtsOutcome.NO_EARPHONES -> {
+                    CopilotStateBus.log(
+                        "TTS",
+                        "Answer NOT spoken: no wired/Bluetooth earphones detected while " +
+                            "\"Strict Earbud-Only Whisper\" is ON.",
+                        isError = true
+                    )
+                    CopilotStateBus.setPipelineStage(PipelineStage.TTS_BLOCKED)
+                }
+                TtsOutcome.NOT_READY -> {
+                    CopilotStateBus.log(
+                        "TTS",
+                        "Answer NOT spoken: the TTS engine is not ready. Check Android Settings > " +
+                            "Text-to-speech output and install the Bengali/English voice data.",
+                        isError = true
+                    )
+                    CopilotStateBus.setPipelineStage(PipelineStage.TTS_FAILED)
+                }
+                TtsOutcome.ENGINE_ERROR -> {
+                    CopilotStateBus.setPipelineStage(PipelineStage.TTS_FAILED)
+                }
             }
         }
     }

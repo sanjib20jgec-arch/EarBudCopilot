@@ -44,6 +44,36 @@ class SettingsPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_REQUIRE_EARPHONES, true)
         set(value) = prefs.edit().putBoolean(KEY_REQUIRE_EARPHONES, value).apply()
 
+    /**
+     * Pre-flight validation: returns a human readable problem with the current pipeline
+     * configuration, or `null` when everything the pipeline needs is present.
+     *
+     * The default providers are intentionally different (Groq for STT, Gemini for the brain), so a
+     * user who enters only one key would otherwise listen forever without ever producing an answer.
+     * Both the UI (before starting) and the service (on start) call this, so the rule lives in one place.
+     */
+    fun configIssue(): String? {
+        val sttKeyMissing = when (sttProvider) {
+            SttProvider.GROQ_WHISPER -> groqApiKey.isBlank()
+            SttProvider.DEEPGRAM_NOVA2 -> deepgramApiKey.isBlank()
+        }
+        if (sttKeyMissing) {
+            return "Speech-to-text (${sttProvider.displayName}) has no API key. " +
+                "Add it in API Keys & Pipeline Engine."
+        }
+
+        val llmKeyMissing = when (llmProvider) {
+            LlmProvider.GEMINI_FLASH -> geminiApiKey.isBlank()
+            LlmProvider.GROQ_LLAMA -> groqApiKey.isBlank()
+        }
+        if (llmKeyMissing) {
+            return "AI brain (${llmProvider.displayName}) has no API key. " +
+                "Add it in API Keys & Pipeline Engine."
+        }
+
+        return null
+    }
+
     companion object {
         private const val KEY_GROQ_API = "groq_api_key"
         private const val KEY_DEEPGRAM_API = "deepgram_api_key"

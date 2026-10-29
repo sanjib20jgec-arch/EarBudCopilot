@@ -5,14 +5,17 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.PowerManager
+import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.copilot.earbud.audio.EarbudTtsManager
 import com.copilot.earbud.data.local.SettingsPreferences
 import com.copilot.earbud.data.remote.AiBrainRepository
+import com.copilot.earbud.domain.model.BrainDecision
 import com.copilot.earbud.domain.model.CopilotUiState
 import com.copilot.earbud.domain.model.LlmProvider
 import com.copilot.earbud.domain.model.SttProvider
+import com.copilot.earbud.domain.model.TtsOutcome
 import com.copilot.earbud.service.AmbientListeningService
 import com.copilot.earbud.service.CopilotStateBus
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -149,6 +152,14 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
             }
             context.startService(stopIntent)
         } else {
+            // Pre-flight: do not enter a listening state that is guaranteed to never answer.
+            val configIssue = prefs.configIssue()
+            if (configIssue != null) {
+                CopilotStateBus.log("CONFIG", "Not started: $configIssue", isError = true)
+                Toast.makeText(context, configIssue, Toast.LENGTH_LONG).show()
+                return
+            }
+
             val startIntent = Intent(context, AmbientListeningService::class.java).apply {
                 action = AmbientListeningService.ACTION_START
             }
@@ -166,21 +177,42 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
     fun simulateBanglishTranscript(sampleTranscript: String) {
         viewModelScope.launch {
             CopilotStateBus.log("SIMULATE", "Testing transcript: \"$sampleTranscript\"")
-            val result = aiBrainRepository.analyzeTranscript(
+
+            val decision = aiBrainRepository.analyzeTranscript(
                 transcript = sampleTranscript,
                 provider = prefs.llmProvider,
                 geminiApiKey = prefs.geminiApiKey,
                 groqApiKey = prefs.groqApiKey
-            )
-            result.onSuccess { answer ->
-                if (answer == null) {
-                    CopilotStateBus.log("BRAIN", "[IGNORE] (Filtered as non-factual/social)")
-                } else {
-                    CopilotStateBus.log("ANSWER", answer, isHighlight = true)
-                    previewTtsManager?.whisperToEarbuds(answer, requireEarphones = prefs.requireEarphonesForTts)
-                }
-            }.onFailure { err ->
+            ).getOrElse { err ->
                 CopilotStateBus.log("LLM_ERR", err.message ?: "Error", isError = true)
+                return@launch
+            }
+
+            when (decision) {
+                is BrainDecision.Failed -> {
+                    CopilotStateBus.log("LLM_ERR", decision.message, isError = true)
+                }
+                is BrainDecision.Ignored -> {
+                    CopilotStateBus.log("FILTER", decision.reason)
+                }
+                is BrainDecision.Answer -> {
+                    CopilotStateBus.log("ANSWER", decision.text, isHighlight = true)
+                    val outcome = previewTtsManager?.whisperToEarbuds(
+                        text = decision.text,
+                        requireEarphones = prefs.requireEarphonesForTts
+                    )
+                    CopilotStateBus.log(
+                        "TTS",
+                        when (outcome) {
+                            TtsOutcome.SPOKEN -> "Test answer spoken."
+                            TtsOutcome.NO_EARPHONES -> "Test answer NOT spoken: no earphones detected."
+                            TtsOutcome.NOT_READY -> "Test answer NOT spoken: TTS engine not ready."
+                            TtsOutcome.ENGINE_ERROR -> "Test answer NOT spoken: TTS engine error."
+                            null -> "Test answer NOT spoken: TTS manager unavailable."
+                        },
+                        isError = outcome != TtsOutcome.SPOKEN
+                    )
+                }
             }
         }
     }

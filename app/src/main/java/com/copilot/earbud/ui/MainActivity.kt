@@ -441,7 +441,10 @@ private fun StatusHeaderCard(
                     color = when (state.pipelineStage) {
                         PipelineStage.SPEECH_DETECTED -> Color(0xFFFACC15)
                         PipelineStage.WHISPERING_TTS -> Color(0xFF4ADE80)
-                        PipelineStage.ERROR -> Color(0xFFF87171)
+                        PipelineStage.FILTERED -> Color(0xFF94A3B8)
+                        PipelineStage.ERROR,
+                        PipelineStage.TTS_FAILED -> Color(0xFFF87171)
+                        PipelineStage.TTS_BLOCKED -> Color(0xFFF59E0B)
                         else -> Color(0xFF38BDF8)
                     }
                 )
