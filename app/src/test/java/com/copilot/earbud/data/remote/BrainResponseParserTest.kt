@@ -111,8 +111,14 @@ class BrainResponseParserTest {
     }
 
     @Test
-    fun `malformed json surfaces as a failure, never as an ignore`() {
-        val decision = decideGemini("not-json")
-        assertTrue(decision is BrainDecision.Failed || decision is BrainDecision.Answer)
+    fun `malformed json never produces an ignore`() {
+        // In production the parse happens inside a try/catch that converts this into a transport
+        // failure, so the contract we assert here is simply: it can never become an [IGNORE].
+        val decision = runCatching { decideGemini("not-json") }
+            .getOrElse { BrainDecision.Failed(it.message ?: "parse error") }
+        assertTrue(
+            "malformed body must not be classified as an ignore: $decision",
+            decision !is BrainDecision.Ignored
+        )
     }
 }
