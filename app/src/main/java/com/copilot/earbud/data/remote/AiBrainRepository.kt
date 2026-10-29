@@ -27,13 +27,23 @@ import java.util.concurrent.TimeUnit
 class AiBrainRepository {
 
     companion object {
+        // Ordered for the FIRST call of a session (the winner is then cached): quality first, but
+        // still Groq-fast. Reasoning models come last because they add seconds of latency.
         private val GROQ_FALLBACK_MODELS = listOf(
-            "openai/gpt-oss-120b",
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
             "openai/gpt-oss-20b",
             "meta-llama/llama-4-scout-17b-16e-instruct",
-            "llama-3.1-8b-instant",
-            "llama-3.3-70b-versatile"
+            "openai/gpt-oss-120b"
         )
+
+        /**
+         * Models that rejected the *model name* itself (HTTP 400/404 "not found / not supported").
+         * They were re-probed on every single utterance, which quietly added a full round-trip of
+         * latency before the working model was reached. Remember them for the process lifetime.
+         */
+        private val unusableModels: MutableSet<String> =
+            java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
         private val GEMINI_FALLBACK_MODELS = listOf(
             "gemini-3.0-flash",
@@ -42,13 +52,17 @@ class AiBrainRepository {
         )
 
         val SYSTEM_PROMPT = """
-You are a discreet, silent earbud assistant listening to natural ambient conversations spoken in code-mixed Bengali and English (Banglish).
+You are a discreet earbud assistant listening to a real conversation in code-mixed Bengali and English (Banglish).
 
-Your tasks:
-1. Determine if the recent transcript contains an explicit factual, informational, or objective question (e.g., "কলকাতা থেকে দিঘার দূরত্ব কত?", "Who is the CEO of Google?", "কালকে ইন্ডিয়ার ম্যাচ কার সাথে?").
-2. Ignore purely personal, conversational, social, or rhetorical remarks (e.g., "তুই কেমন আছিস?", "চা খাবি?", "আজকে খুব গরম পড়েছে তাই না?").
-3. If it is NOT an objective/factual question, output EXACTLY AND ONLY: [IGNORE]
-4. If it IS an objective/factual question, provide a factual answer strictly in ONE short, crisp sentence (maximum 12-15 words) in the same conversational language mix (Bengali/Banglish/English). Do not include pleasantries, disclaimers, or conversational filler.
+Rules:
+1. If the transcript asks a factual, informational or objective question, answer it.
+2. If it is small talk, personal, social or rhetorical (e.g. "তুই কেমন আছিস?", "চা খাবি?", "আজকে গরম তাই না?"), reply with exactly and only: [IGNORE]
+3. The transcript may be a partially heard or ungrammatical fragment. If the question is still recognisable, answer it anyway.
+4. Answer in ONE short sentence of at most 15 words, using the same language mix and script as the question: Bengali script for Bengali, Banglish in Latin letters for Banglish, English for English.
+5. State the fact directly. No preamble ("Sure", "Here is"), no explanation, no disclaimer, no second sentence.
+
+Example good answer: "দিঘা কলকাতা থেকে প্রায় ১৮৫ কিলোমিটার দূরে।"
+Example bad answer: "Sure! The distance from Kolkata to Digha is about 185 km by road, which takes around four hours."
         """.trimIndent()
     }
 
@@ -183,11 +197,12 @@ Your tasks:
         require(apiKey.isNotBlank()) { "Gemini API key is missing. Enter it in API Keys & Pipeline Engine." }
 
         val candidates = LinkedHashSet<String>()
-        resolvedGeminiModel?.let { candidates.add(it) }
+        resolvedGeminiModel?.let { if (it !in unusableModels) candidates.add(it) }
         candidates.addAll(GEMINI_FALLBACK_MODELS)
 
         var lastError = ""
         for (modelId in candidates) {
+            if (modelId in unusableModels) continue
             when (val call = tryGeminiGenerateContent(transcript, apiKey, modelId)) {
                 is ProviderCall.Text -> {
                     resolvedGeminiModel = modelId
@@ -219,7 +234,7 @@ Your tasks:
 
         // Dynamic fallback: query /v1beta/models to find any active model supporting generateContent.
         for (modelId in fetchAvailableGeminiModels(apiKey)) {
-            if (modelId in candidates) continue
+            if (modelId in candidates || modelId in unusableModels) continue
             when (val call = tryGeminiGenerateContent(transcript, apiKey, modelId)) {
                 is ProviderCall.Text -> {
                     resolvedGeminiModel = modelId
@@ -292,6 +307,9 @@ Your tasks:
             executeWithRetry(request).use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
+                    if (isUnusableModelResponse(response.code, bodyStr)) {
+                        unusableModels.add(cleanModel.removePrefix("models/"))
+                    }
                     return ProviderCall.HttpError(
                         cleanModel,
                         "Gemini ($cleanModel) HTTP ${response.code}: ${bodyStr.take(200)}"
@@ -359,11 +377,12 @@ Your tasks:
         require(apiKey.isNotBlank()) { "Groq API key is missing. Enter it in API Keys & Pipeline Engine." }
 
         val candidates = LinkedHashSet<String>()
-        resolvedGroqModel?.let { candidates.add(it) }
+        resolvedGroqModel?.let { if (it !in unusableModels) candidates.add(it) }
         candidates.addAll(GROQ_FALLBACK_MODELS)
 
         var lastError = ""
         for (modelId in candidates) {
+            if (modelId in unusableModels) continue
             when (val call = tryGroqChatCompletion(transcript, apiKey, modelId)) {
                 is ProviderCall.Text -> {
                     resolvedGroqModel = modelId
@@ -375,7 +394,7 @@ Your tasks:
         }
 
         for (modelId in fetchAvailableGroqModels(apiKey)) {
-            if (modelId in candidates) continue
+            if (modelId in candidates || modelId in unusableModels) continue
             when (val call = tryGroqChatCompletion(transcript, apiKey, modelId)) {
                 is ProviderCall.Text -> {
                     resolvedGroqModel = modelId
@@ -427,6 +446,9 @@ Your tasks:
             executeWithRetry(request).use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
+                    if (isUnusableModelResponse(response.code, bodyStr)) {
+                        unusableModels.add(modelId)
+                    }
                     return ProviderCall.HttpError(
                         modelId,
                         "Groq ($modelId) HTTP ${response.code}: ${bodyStr.take(200)}"
@@ -439,6 +461,21 @@ Your tasks:
         } catch (t: Throwable) {
             ProviderCall.HttpError(modelId, "Groq ($modelId) request failed: ${t.message}")
         }
+    }
+
+    /**
+     * True only when the provider rejected the model itself, not the request content: a bad
+     * `thinkingConfig` (also HTTP 400) must NOT blacklist an otherwise healthy model.
+     */
+    private fun isUnusableModelResponse(code: Int, body: String): Boolean {
+        if (code != 400 && code != 404) return false
+        val lower = body.lowercase()
+        return lower.contains("not found") ||
+            lower.contains("not supported") ||
+            lower.contains("does not exist") ||
+            lower.contains("no longer available") ||
+            lower.contains("decommissioned") ||
+            lower.contains("is not a valid model")
     }
 
     private fun isReasoningModel(modelId: String): Boolean {

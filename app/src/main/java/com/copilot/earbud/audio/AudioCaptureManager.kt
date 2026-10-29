@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -23,14 +24,16 @@ class AudioCaptureManager(
     initialRmsThreshold: Float,
     private val onRmsUpdate: (Float) -> Unit,
     private val onSpeechStateChanged: (Boolean) -> Unit,
-    private val onUtteranceCaptured: suspend (ByteArray, Float) -> Unit,
+    private val onUtteranceCaptured: suspend (ByteArray, Float, Boolean) -> Unit,
     private val onError: (String) -> Unit
 ) {
     companion object {
         const val SAMPLE_RATE = 16000
         private const val FRAME_SAMPLES = 512 // 32ms per frame at 16kHz
         private const val PRE_ROLL_FRAMES = 12 // ~384ms pre-roll before speech trigger
-        private const val SILENCE_TAIL_MS = 800L // 800ms of silence finalizes chunk
+        // 800ms of trailing silence used to be spent before transcription even started; 550ms is
+        // still comfortably longer than a natural inter-word pause but cuts ~250ms off every answer.
+        private const val SILENCE_TAIL_MS = 550L
         private const val MIN_SPEECH_DURATION_MS = 650L // Ignore tiny clicks/coughs < 650ms
         private const val MAX_SPEECH_DURATION_MS = 10000L // Force-dispatch chunk at 10 seconds
         private const val SPEECH_VOTE_WINDOW = 3 // 2-of-3 frames must agree before a state change
@@ -40,9 +43,18 @@ class AudioCaptureManager(
     private val vadDetector = SileroVadDetector(context, initialRmsThreshold)
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
+    private var echoCanceler: AcousticEchoCanceler? = null
 
+    /**
+     * True when we are keeping the mic open while the answer is spoken (so surrounding voices are
+     * not missed). When false the old behaviour is used: capture is suspended during TTS.
+     */
     @Volatile
-    var isPausedForTts: Boolean = false
+    var keepListeningDuringTts: Boolean = true
+
+    /** Set by the service while the answer is being spoken. */
+    @Volatile
+    var ttsSpeaking: Boolean = false
 
     fun setVadThreshold(threshold: Float) {
         vadDetector.rmsThreshold = threshold
@@ -84,6 +96,7 @@ class AudioCaptureManager(
 
         audioRecord = recorder
         recorder.startRecording()
+        echoCanceler = enableEchoCancellation(recorder)
 
         captureJob = scope.launch(Dispatchers.IO) {
             val frameBuffer = ShortArray(FRAME_SAMPLES)
@@ -92,6 +105,7 @@ class AudioCaptureManager(
             val activeSpeechPcm = ArrayList<Short>(SAMPLE_RATE * 6)
 
             var isCurrentlySpeaking = false
+            var utteranceOverlapsTts = false
             var speechStartTimestampMs = 0L
             var lastVoiceTimestampMs = 0L
             var uiRmsThrottleCounter = 0
@@ -101,13 +115,20 @@ class AudioCaptureManager(
                     val readCount = recorder.read(frameBuffer, 0, FRAME_SAMPLES)
                     if (readCount <= 0) continue
 
-                    // Mute mic capture while TTS is whispering to prevent self-triggering
-                    if (isPausedForTts) {
+                    // While the answer is being spoken we normally KEEP capturing, so a question
+                    // asked during the reply is not lost. The utterance is flagged and the service
+                    // discards it if it turns out to be our own TTS leaking back into the mic.
+                    val speakingNow = ttsSpeaking
+                    if (speakingNow) {
+                        utteranceOverlapsTts = true
+                    }
+                    if (speakingNow && !keepListeningDuringTts) {
                         if (isCurrentlySpeaking) {
                             isCurrentlySpeaking = false
                             activeSpeechPcm.clear()
                             onSpeechStateChanged(false)
                         }
+                        utteranceOverlapsTts = false
                         continue
                     }
 
@@ -130,6 +151,7 @@ class AudioCaptureManager(
                         if (!isCurrentlySpeaking) {
                             isCurrentlySpeaking = true
                             speechStartTimestampMs = now
+                            utteranceOverlapsTts = speakingNow
                             onSpeechStateChanged(true)
 
                             // Prepend pre-roll frames so the first consonant of a Banglish word isn't clipped
@@ -144,7 +166,7 @@ class AudioCaptureManager(
 
                         // Force-finalize if continuous speech reaches max window (10s)
                         if (now - speechStartTimestampMs >= MAX_SPEECH_DURATION_MS) {
-                            finalizeAndDispatch(activeSpeechPcm, now - speechStartTimestampMs)
+                            finalizeAndDispatch(activeSpeechPcm, now - speechStartTimestampMs, utteranceOverlapsTts)
                             isCurrentlySpeaking = false
                             onSpeechStateChanged(false)
                         }
@@ -155,7 +177,7 @@ class AudioCaptureManager(
                             if (silenceElapsed >= SILENCE_TAIL_MS) {
                                 val totalSpeechDuration = lastVoiceTimestampMs - speechStartTimestampMs
                                 if (totalSpeechDuration >= MIN_SPEECH_DURATION_MS) {
-                                    finalizeAndDispatch(activeSpeechPcm, totalSpeechDuration)
+                                    finalizeAndDispatch(activeSpeechPcm, totalSpeechDuration, utteranceOverlapsTts)
                                 } else {
                                     activeSpeechPcm.clear()
                                 }
@@ -181,7 +203,11 @@ class AudioCaptureManager(
         }
     }
 
-    private suspend fun finalizeAndDispatch(pcmList: ArrayList<Short>, durationMs: Long) {
+    private suspend fun finalizeAndDispatch(
+        pcmList: ArrayList<Short>,
+        durationMs: Long,
+        overlapsTts: Boolean
+    ) {
         if (pcmList.isEmpty()) return
         val shorts = ShortArray(pcmList.size)
         for (i in pcmList.indices) {
@@ -190,7 +216,17 @@ class AudioCaptureManager(
         pcmList.clear()
         val wavBytes = WavEncoder.encodePcm16MonoToWav(shorts, SAMPLE_RATE)
         val durationSec = durationMs / 1000f
-        onUtteranceCaptured(wavBytes, durationSec)
+        onUtteranceCaptured(wavBytes, durationSec, overlapsTts)
+    }
+
+    private fun enableEchoCancellation(recorder: AudioRecord): AcousticEchoCanceler? = try {
+        if (AcousticEchoCanceler.isAvailable()) {
+            AcousticEchoCanceler.create(recorder.audioSessionId)?.also { it.enabled = true }
+        } else {
+            null
+        }
+    } catch (t: Throwable) {
+        null
     }
 
     fun stopCapture() {
@@ -206,6 +242,11 @@ class AudioCaptureManager(
                 }
             }
         }
+        runCatching {
+            echoCanceler?.enabled = false
+            echoCanceler?.release()
+        }
+        echoCanceler = null
         runCatching { audioRecord?.release() }
         audioRecord = null
         runCatching { vadDetector.close() }

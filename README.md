@@ -22,12 +22,15 @@ microphone -> VAD -> WAV chunk -> STT (Groq Whisper / Deepgram) -> LLM (Gemini /
    `PARTIAL_WAKE_LOCK`. Owns the pipeline and a **single sequential consumer** (`Channel`) so two
    utterances can never overlap.
 2. **`AudioCaptureManager`** – 16 kHz / 16-bit / mono `AudioRecord` (`VOICE_RECOGNITION`), 32 ms
-   frames, 384 ms pre-roll, 800 ms silence tail, 0.65 s minimum and 10 s maximum utterance,
-   **2-of-3 frame vote** for VAD hysteresis.
+   frames, 384 ms pre-roll, **550 ms silence tail**, 0.65 s minimum and 10 s maximum utterance,
+   **2-of-3 frame vote** for VAD hysteresis, plus platform `AcousticEchoCanceler`.
+   The microphone is **not muted while the answer is spoken**: capture continues so surrounding
+   voices are not missed, and each chunk is tagged with whether it overlapped our own TTS.
 3. **`SileroVadDetector`** – uses `silero_vad.onnx` from assets when present, otherwise an
    RMS + zero-crossing acoustic detector.
-4. **`SttRepository`** – Groq Whisper (`whisper-large-v3-turbo` → `whisper-large-v3`) or Deepgram
-   Nova-2, with **cross-provider fallback** and one retry on 429/5xx.
+4. **`SttRepository`** – Groq Whisper (`whisper-large-v3-turbo` for *Fast*, `whisper-large-v3` for
+   *Accurate*) or Deepgram Nova-2, with **cross-provider fallback**, an optional **language hint**
+   (Auto / Bengali / English) and one retry on 429/5xx.
 5. **`AiBrainRepository`** – Gemini `generateContent` or Groq chat completions with model discovery
    and fallback. Returns a typed `BrainDecision`: `Answer`, `Ignored` (the model really said
    `[IGNORE]`) or `Failed` (HTTP, auth, quota, empty, truncated or safety-blocked). **A failed or
@@ -37,9 +40,20 @@ microphone -> VAD -> WAV chunk -> STT (Groq Whisper / Deepgram) -> LLM (Gemini /
 7. **`BootResumeReceiver`** – after a reboot it posts a one-tap "resume listening" notification
    (Android 14+ forbids starting a microphone foreground service from the background).
 
+## Settings
+
+| Setting | Effect |
+|---|---|
+| **Keep Listening While Speaking** | microphone stays open during the reply (default ON). Our own voice is dropped by `SelfEchoDetector` instead of muting the mic |
+| **Transcription Language** | `Auto`, `Bengali (bn)` or `English (en)` hint sent to Whisper/Deepgram - the single biggest lever for Banglish accuracy |
+| **Whisper Model** | `Fast` (`large-v3-turbo`, lowest latency) or `Accurate` (`large-v3`) |
+
 ## Diagnostics
 
-The app has an in-app activity log with these tags:
+The app has an in-app activity log with these tags. Newest entries are on top and the panel stays
+pinned to the newest line, so no scrolling is needed while the copilot is running; if you scroll
+back to read history, a **↑ Newest** button (with the number of lines that arrived meanwhile) jumps
+back up:
 
 | Tag | Meaning |
 |---|---|
@@ -47,6 +61,8 @@ The app has an in-app activity log with these tags:
 | `STT` | transcript (`Heard: "..."`) or "too short" |
 | `STT_ERR` / `LLM_ERR` | the stage failed - the message names the cause |
 | `FILTER` | the model deliberately classified the speech as non-factual |
+| `ECHO` | ignored: the mic picked up our own answer (`SelfEchoDetector`), surrounding voices are still captured |
+| `PERF` | per-utterance timings in ms: STT, AI, speak and end-to-end |
 | `ANSWER` | an answer was generated (highlighted) |
 | `TTS` | spoken / blocked (no earphones) / engine not ready |
 | `CONFIG` | the pipeline refused to start because a key is missing |

@@ -14,8 +14,10 @@ import com.copilot.earbud.data.remote.AiBrainRepository
 import com.copilot.earbud.domain.model.BrainDecision
 import com.copilot.earbud.domain.model.CopilotUiState
 import com.copilot.earbud.domain.model.LlmProvider
+import com.copilot.earbud.domain.model.SttLanguage
 import com.copilot.earbud.domain.model.SttProvider
 import com.copilot.earbud.domain.model.TtsOutcome
+import com.copilot.earbud.domain.model.WhisperMode
 import com.copilot.earbud.service.AmbientListeningService
 import com.copilot.earbud.service.CopilotStateBus
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,6 +48,9 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
     private val _geminiKeySet = MutableStateFlow(prefs.hasGeminiKey)
     private val _vadThreshold = MutableStateFlow(prefs.vadThresholdRms)
     private val _requireEarphones = MutableStateFlow(prefs.requireEarphonesForTts)
+    private val _keepListeningDuringTts = MutableStateFlow(prefs.keepListeningDuringTts)
+    private val _sttLanguage = MutableStateFlow(prefs.sttLanguage)
+    private val _whisperMode = MutableStateFlow(prefs.whisperMode)
     private val _batteryOptIgnored = MutableStateFlow(checkBatteryOptimizationIgnored())
 
     val uiState: StateFlow<CopilotUiState> = combine(
@@ -72,15 +77,24 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
         )
     }.combine(
         combine(
-            _sttProvider,
-            _llmProvider,
-            _groqKeySet,
-            _deepgramKeySet,
-            _geminiKeySet
-        ) { stt, llm, groq, dg, gemini ->
-             Tuple5(stt, llm, groq, dg, gemini)
-        }
-    ) { base, keys ->
+            combine(
+                _sttProvider,
+                _llmProvider,
+                _groqKeySet,
+                _deepgramKeySet,
+                _geminiKeySet
+            ) { stt, llm, groq, dg, gemini ->
+                Tuple5(stt, llm, groq, dg, gemini)
+            },
+            combine(
+                _keepListeningDuringTts,
+                _sttLanguage,
+                _whisperMode
+            ) { keepListening, language, whisper -> Triple(keepListening, language, whisper) }
+        ) { keys, listening -> keys to listening }
+    ) { base, pair ->
+        val keys = pair.first
+        val listening = pair.second
         base.copy(
             sttProvider = keys.a,
             llmProvider = keys.b,
@@ -89,6 +103,9 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
             geminiKeySet = keys.e,
             vadThresholdRms = _vadThreshold.value,
             requireEarphonesForTts = _requireEarphones.value,
+            keepListeningDuringTts = listening.first,
+            sttLanguage = listening.second,
+            whisperMode = listening.third,
             isBatteryOptimizationIgnored = _batteryOptIgnored.value
         )
     }.stateIn(
@@ -131,6 +148,23 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
     fun setRequireEarphones(require: Boolean) {
         prefs.requireEarphonesForTts = require
         _requireEarphones.value = require
+    }
+
+    /** Mic stays open while the answer is spoken (self-echo is filtered, not the microphone). */
+    fun setKeepListeningDuringTts(keep: Boolean) {
+        prefs.keepListeningDuringTts = keep
+        _keepListeningDuringTts.value = keep
+        notifyServiceConfigUpdated()
+    }
+
+    fun selectSttLanguage(language: SttLanguage) {
+        prefs.sttLanguage = language
+        _sttLanguage.value = language
+    }
+
+    fun selectWhisperMode(mode: WhisperMode) {
+        prefs.whisperMode = mode
+        _whisperMode.value = mode
     }
 
     fun refreshBatteryOptimizationState() {
