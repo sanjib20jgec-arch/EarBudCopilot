@@ -13,16 +13,26 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Speech-to-Text Repository supporting:
- * 1. Groq Whisper (`whisper-large-v3`) via multipart/form-data with Banglish prompt hint
+ * 1. Groq Whisper (`whisper-large-v3-turbo` / `whisper-large-v3` auto-fallback) via multipart/form-data
  * 2. Deepgram Nova-2 (`nova-2`) via raw audio/wav binary POST
  */
 class SttRepository {
+
+    companion object {
+        private val GROQ_WHISPER_MODELS = listOf(
+            "whisper-large-v3-turbo",
+            "whisper-large-v3"
+        )
+    }
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .build()
+
+    @Volatile
+    private var resolvedWhisperModel: String? = null
 
     suspend fun transcribeWav(
         wavBytes: ByteArray,
@@ -39,40 +49,48 @@ class SttRepository {
     }
 
     private fun transcribeWithGroqWhisper(wavBytes: ByteArray, apiKey: String): String {
-        require(apiKey.isNotBlank()) { "Groq API key is missing. Enter it in the control panel." }
+        require(apiKey.isNotBlank()) { "Groq API key is missing. Tap the top-right settings icon and enter it." }
 
-        val wavBody = wavBytes.toRequestBody("audio/wav".toMediaType())
-        val multipartBody = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart("file", "ambient_chunk.wav", wavBody)
-            .addFormDataPart("model", "whisper-large-v3")
-            // Prompt guides Whisper to accurately transcribe code-mixed Bengali & English (Banglish)
-            .addFormDataPart(
-                "prompt",
-                "Natural conversation in code-mixed Bengali and English (Banglish). কলকাতা থেকে দিঘার দূরত্ব কত? Who is the CEO of Google? কালকে ইন্ডিয়ার ম্যাচ কার সাথে?"
-            )
-            .addFormDataPart("temperature", "0.0")
-            .addFormDataPart("response_format", "json")
-            .build()
+        val candidates = LinkedHashSet<String>()
+        resolvedWhisperModel?.let { candidates.add(it) }
+        candidates.addAll(GROQ_WHISPER_MODELS)
 
-        val request = Request.Builder()
-            .url("https://api.groq.com/openai/v1/audio/transcriptions")
-            .addHeader("Authorization", "Bearer $apiKey")
-            .post(multipartBody)
-            .build()
+        var lastError = ""
+        for (modelId in candidates) {
+            val wavBody = wavBytes.toRequestBody("audio/wav".toMediaType())
+            val multipartBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", "ambient_chunk.wav", wavBody)
+                .addFormDataPart("model", modelId)
+                .addFormDataPart(
+                    "prompt",
+                    "Natural conversation in code-mixed Bengali and English (Banglish). কলকাতা থেকে দিঘার দূরত্ব কত? Who is the CEO of Google? কালকে ইন্ডিয়ার ম্যাচ কার সাথে?"
+                )
+                .addFormDataPart("temperature", "0.0")
+                .addFormDataPart("response_format", "json")
+                .build()
 
-        httpClient.newCall(request).execute().use { response ->
-            val bodyStr = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IllegalStateException("Groq STT HTTP ${response.code}: ${bodyStr.take(180)}")
+            val request = Request.Builder()
+                .url("https://api.groq.com/openai/v1/audio/transcriptions")
+                .addHeader("Authorization", "Bearer $apiKey")
+                .post(multipartBody)
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (response.isSuccessful) {
+                    resolvedWhisperModel = modelId
+                    val json = JSONObject(bodyStr)
+                    return json.optString("text", "").trim()
+                }
+                lastError = "Groq STT ($modelId) HTTP ${response.code}: ${bodyStr.take(160)}"
             }
-            val json = JSONObject(bodyStr)
-            return json.optString("text", "").trim()
         }
+        throw IllegalStateException(lastError)
     }
 
     private fun transcribeWithDeepgram(wavBytes: ByteArray, apiKey: String): String {
-        require(apiKey.isNotBlank()) { "Deepgram API key is missing. Enter it in the control panel." }
+        require(apiKey.isNotBlank()) { "Deepgram API key is missing. Tap the top-right settings icon and enter it." }
 
         val requestBody = wavBytes.toRequestBody("audio/wav".toMediaType())
         val request = Request.Builder()
