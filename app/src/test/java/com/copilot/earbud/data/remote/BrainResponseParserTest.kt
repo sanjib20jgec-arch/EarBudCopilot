@@ -27,8 +27,8 @@ class BrainResponseParserTest {
         )
         assertTrue("expected Failed but was $decision", decision is BrainDecision.Failed)
         assertTrue(
-            (decision as BrainDecision.Failed).message.contains("MAX_TOKENS"),
-            "diagnostic reason should name the truncation: ${decision.message}"
+            "diagnostic reason should name the truncation: ${(decision as BrainDecision.Failed).message}",
+            decision.message.contains("MAX_TOKENS")
         )
     }
 
