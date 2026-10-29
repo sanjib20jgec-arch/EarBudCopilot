@@ -506,6 +506,25 @@ private fun StatusHeaderCard(
                     color = Color(0xFF94A3B8)
                 )
             }
+
+            // One-line explanation for the states where nothing was heard on purpose / on failure.
+            val stageHint = when (state.pipelineStage) {
+                PipelineStage.ERROR -> "Last attempt failed - read the red line in the activity log."
+                PipelineStage.FILTERED -> "The AI decided this was not a factual question."
+                PipelineStage.TTS_BLOCKED -> "Answer ready but not spoken: no earphones detected (strict mode)."
+                PipelineStage.TTS_FAILED -> "Answer ready but the TTS engine could not speak it."
+                else -> null
+            }
+            if (stageHint != null) {
+                Text(
+                    text = stageHint,
+                    fontSize = 11.sp,
+                    color = when (state.pipelineStage) {
+                        PipelineStage.FILTERED -> Color(0xFF94A3B8)
+                        else -> Color(0xFFF87171)
+                    }
+                )
+            }
         }
     }
 }
