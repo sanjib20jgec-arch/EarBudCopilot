@@ -15,6 +15,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -268,7 +269,9 @@ fun CopilotControlScreen(
 
                         // STT Provider Selector
                         Text("Speech-to-Text (Banglish):", fontSize = 12.sp, color = Color(0xFF94A3B8))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             SttProvider.entries.forEach { provider ->
                                 FilterChip(
                                     selected = state.sttProvider == provider,
@@ -280,7 +283,9 @@ fun CopilotControlScreen(
 
                         // LLM Provider Selector
                         Text("AI Brain (Single-Sentence Filter):", fontSize = 12.sp, color = Color(0xFF94A3B8))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             LlmProvider.entries.forEach { provider ->
                                 FilterChip(
                                     selected = state.llmProvider == provider,
@@ -406,7 +411,9 @@ fun CopilotControlScreen(
 
                         // Transcription language hint (biggest single lever on Banglish accuracy)
                         Text("Transcription Language:", fontSize = 12.sp, color = Color(0xFF94A3B8))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             SttLanguage.entries.forEach { language ->
                                 FilterChip(
                                     selected = state.sttLanguage == language,
@@ -418,7 +425,9 @@ fun CopilotControlScreen(
 
                         // Whisper model trade-off: speed vs accuracy
                         Text("Whisper Model:", fontSize = 12.sp, color = Color(0xFF94A3B8))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             WhisperMode.entries.forEach { mode ->
                                 FilterChip(
                                     selected = state.whisperMode == mode,
@@ -631,7 +640,9 @@ private fun VadThresholdLabels(threshold: Float, rmsFlow: StateFlow<Float>) {
 @Composable
 private fun QuickTestBar(onSimulateTranscript: (String) -> Unit) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         AssistChip(

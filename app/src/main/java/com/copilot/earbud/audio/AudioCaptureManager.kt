@@ -69,6 +69,12 @@ class AudioCaptureManager(
         private const val PRE_ROLL_FRAMES = 12 // ~384ms pre-roll before speech trigger
         // 800ms of trailing silence used to be spent before transcription even started; 550ms is
         // still comfortably longer than a natural inter-word pause but cuts ~250ms off every answer.
+        /**
+         * Extra head-room on the voice gate while the answer is being spoken, so speaker/earbud
+         * bleed does not start an utterance. A person talking over the earbuds is clearly louder.
+         */
+        private const val ECHO_GATE_MULTIPLIER = 1.5f
+
         /** Give up on the microphone after this many consecutive failed reads. */
         private const val MAX_CONSECUTIVE_READ_ERRORS = 20
         private const val READ_ERROR_BACKOFF_MS = 50L
@@ -196,7 +202,16 @@ class AudioCaptureManager(
                     }
 
                     val frameCopy = frameBuffer.copyOf(readCount)
-                    val (isSpeechFrame, rms) = vadDetector.evaluateFrame(frameCopy, readCount)
+                    val (voiceDetected, rms) = vadDetector.evaluateFrame(frameCopy, readCount)
+
+                    // While our own answer is playing, only a clearly louder voice counts as speech.
+                    // Without this gate the earbud output itself kept re-triggering the pipeline:
+                    // every chunk meant another upload, the phone got warm and the UI stuttered.
+                    val isSpeechFrame = if (speakingNow) {
+                        voiceDetected && rms >= vadDetector.rmsThreshold * ECHO_GATE_MULTIPLIER
+                    } else {
+                        voiceDetected
+                    }
 
                     // Hysteresis: a single noisy/marginal frame can no longer start or break an
                     // utterance, which previously split questions into pieces or dropped them.
