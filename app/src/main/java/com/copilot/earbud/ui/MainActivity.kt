@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -15,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -34,14 +36,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import com.copilot.earbud.domain.model.CopilotUiState
 import com.copilot.earbud.domain.model.LlmProvider
@@ -72,6 +78,9 @@ class MainActivity : ComponentActivity() {
                 val state by viewModel.uiState.collectAsState()
                 CopilotControlScreen(
                     state = state,
+                    stageFlow = viewModel.pipelineStage,
+                    rmsFlow = viewModel.rms,
+                    logsFlow = viewModel.logs,
                     onToggleService = { viewModel.toggleService() },
                     onSttProviderChange = viewModel::selectSttProvider,
                     onLlmProviderChange = viewModel::selectLlmProvider,
@@ -112,6 +121,9 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun CopilotControlScreen(
     state: CopilotUiState,
+    stageFlow: StateFlow<PipelineStage>,
+    rmsFlow: StateFlow<Float>,
+    logsFlow: StateFlow<List<LogEntry>>,
     onToggleService: () -> Unit,
     onSttProviderChange: (SttProvider) -> Unit,
     onLlmProviderChange: (LlmProvider) -> Unit,
@@ -210,6 +222,8 @@ fun CopilotControlScreen(
             // 1. Earphone Connection & Pipeline Status Banner
             StatusHeaderCard(
                 state = state,
+                stageFlow = stageFlow,
+                rmsFlow = rmsFlow,
                 onToggleClick = {
                     val hasMic = ContextCompat.checkSelfPermission(
                         context,
@@ -258,7 +272,9 @@ fun CopilotControlScreen(
 
                         // STT Provider Selector
                         Text("Speech-to-Text (Banglish):", fontSize = 12.sp, color = Color(0xFF94A3B8))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             SttProvider.entries.forEach { provider ->
                                 FilterChip(
                                     selected = state.sttProvider == provider,
@@ -270,7 +286,9 @@ fun CopilotControlScreen(
 
                         // LLM Provider Selector
                         Text("AI Brain (Single-Sentence Filter):", fontSize = 12.sp, color = Color(0xFF94A3B8))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             LlmProvider.entries.forEach { provider ->
                                 FilterChip(
                                     selected = state.llmProvider == provider,
@@ -341,10 +359,9 @@ fun CopilotControlScreen(
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Text("VAD Voice Trigger Threshold", fontSize = 12.sp)
-                                Text(
-                                    "RMS: ${state.vadThresholdRms.toInt()} (Live: ${state.currentRmsDb.toInt()})",
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.secondary
+                                VadThresholdLabels(
+                                    threshold = state.vadThresholdRms,
+                                    rmsFlow = rmsFlow
                                 )
                             }
                             Slider(
@@ -397,7 +414,9 @@ fun CopilotControlScreen(
 
                         // Transcription language hint (biggest single lever on Banglish accuracy)
                         Text("Transcription Language:", fontSize = 12.sp, color = Color(0xFF94A3B8))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             SttLanguage.entries.forEach { language ->
                                 FilterChip(
                                     selected = state.sttLanguage == language,
@@ -409,7 +428,9 @@ fun CopilotControlScreen(
 
                         // Whisper model trade-off: speed vs accuracy
                         Text("Whisper Model:", fontSize = 12.sp, color = Color(0xFF94A3B8))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             WhisperMode.entries.forEach { mode ->
                                 FilterChip(
                                     selected = state.whisperMode == mode,
@@ -456,7 +477,7 @@ fun CopilotControlScreen(
 
             // 4. Real-Time Pipeline Status Logs
             LogsPanel(
-                logs = state.logs,
+                logsFlow = logsFlow,
                 onClearLogs = onClearLogs,
                 modifier = Modifier.weight(1f)
             )
@@ -467,6 +488,8 @@ fun CopilotControlScreen(
 @Composable
 private fun StatusHeaderCard(
     state: CopilotUiState,
+    stageFlow: StateFlow<PipelineStage>,
+    rmsFlow: StateFlow<Float>,
     onToggleClick: () -> Unit
 ) {
     val buttonColor by animateColorAsState(
@@ -532,64 +555,97 @@ private fun StatusHeaderCard(
                 }
             }
 
-            // Pipeline Stage Pill
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF0F172A))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Stage: ${state.pipelineStage.name}",
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = when (state.pipelineStage) {
-                        PipelineStage.SPEECH_DETECTED -> Color(0xFFFACC15)
-                        PipelineStage.WHISPERING_TTS -> Color(0xFF4ADE80)
-                        PipelineStage.FILTERED -> Color(0xFF94A3B8)
-                        PipelineStage.ERROR,
-                        PipelineStage.TTS_FAILED -> Color(0xFFF87171)
-                        PipelineStage.TTS_BLOCKED -> Color(0xFFF59E0B)
-                        else -> Color(0xFF38BDF8)
-                    }
-                )
-                Text(
-                    text = "Mic RMS: ${state.currentRmsDb.toInt()}",
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = Color(0xFF94A3B8)
-                )
-            }
-
-            // One-line explanation for the states where nothing was heard on purpose / on failure.
-            val stageHint = when (state.pipelineStage) {
-                PipelineStage.ERROR -> "Last attempt failed - read the red line in the activity log."
-                PipelineStage.FILTERED -> "The AI decided this was not a factual question."
-                PipelineStage.TTS_BLOCKED -> "Answer ready but not spoken: no earphones detected (strict mode)."
-                PipelineStage.TTS_FAILED -> "Answer ready but the TTS engine could not speak it."
-                else -> null
-            }
-            if (stageHint != null) {
-                Text(
-                    text = stageHint,
-                    fontSize = 11.sp,
-                    color = when (state.pipelineStage) {
-                        PipelineStage.FILTERED -> Color(0xFF94A3B8)
-                        else -> Color(0xFFF87171)
-                    }
-                )
-            }
+            // Pipeline stage and live level change many times per second, so they collect their
+            // own flows: only these two small composables recompose, not the whole screen.
+            StagePill(stageFlow = stageFlow, rmsFlow = rmsFlow)
+            StageHint(stageFlow = stageFlow)
         }
     }
 }
 
 @Composable
+private fun StagePill(stageFlow: StateFlow<PipelineStage>, rmsFlow: StateFlow<Float>) {
+    val stage by stageFlow.collectAsState()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color(0xFF0F172A))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "Stage: ${stage.name}",
+            fontSize = 12.sp,
+            fontFamily = FontFamily.Monospace,
+            color = when (stage) {
+                PipelineStage.SPEECH_DETECTED -> Color(0xFFFACC15)
+                PipelineStage.WHISPERING_TTS -> Color(0xFF4ADE80)
+                PipelineStage.FILTERED -> Color(0xFF94A3B8)
+                PipelineStage.ERROR,
+                PipelineStage.TTS_FAILED -> Color(0xFFF87171)
+                PipelineStage.TTS_BLOCKED -> Color(0xFFF59E0B)
+                else -> Color(0xFF38BDF8)
+            }
+        )
+        LiveRmsText(rmsFlow = rmsFlow, prefix = "Mic RMS: ")
+    }
+}
+
+/** One-line explanation for the states where nothing was heard on purpose / on failure. */
+@Composable
+private fun StageHint(stageFlow: StateFlow<PipelineStage>) {
+    val stage by stageFlow.collectAsState()
+    val stageHint = when (stage) {
+        PipelineStage.ERROR -> "Last attempt failed - read the red line in the activity log."
+        PipelineStage.FILTERED -> "The AI decided this was not a factual question."
+        PipelineStage.TTS_BLOCKED -> "Answer ready but not spoken: no earphones detected (strict mode)."
+        PipelineStage.TTS_FAILED -> "Answer ready but the TTS engine could not speak it."
+        else -> null
+    }
+    if (stageHint != null) {
+        Text(
+            text = stageHint,
+            fontSize = 11.sp,
+            color = if (stage == PipelineStage.FILTERED) Color(0xFF94A3B8) else Color(0xFFF87171)
+        )
+    }
+}
+
+/** Live microphone level; recomposes on its own every few hundred milliseconds. */
+@Composable
+private fun LiveRmsText(
+    rmsFlow: StateFlow<Float>,
+    prefix: String,
+    fontSize: TextUnit = 12.sp,
+    color: Color = Color(0xFF94A3B8)
+) {
+    val rms by rmsFlow.collectAsState()
+    Text(
+        text = "$prefix${rms.toInt()}",
+        fontSize = fontSize,
+        fontFamily = FontFamily.Monospace,
+        color = color
+    )
+}
+
+@Composable
+private fun VadThresholdLabels(threshold: Float, rmsFlow: StateFlow<Float>) {
+    val rms by rmsFlow.collectAsState()
+    Text(
+        text = "RMS: ${threshold.toInt()} (Live: ${rms.toInt()})",
+        fontSize = 12.sp,
+        color = MaterialTheme.colorScheme.secondary
+    )
+}
+
+@Composable
 private fun QuickTestBar(onSimulateTranscript: (String) -> Unit) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         AssistChip(
@@ -607,10 +663,41 @@ private fun QuickTestBar(onSimulateTranscript: (String) -> Unit) {
 
 @Composable
 private fun LogsPanel(
+    logsFlow: StateFlow<List<LogEntry>>,
+    onClearLogs: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    // The log changes on every pipeline event; collecting it here keeps that churn out of the
+    // control screen's recomposition scope.
+    val logs by logsFlow.collectAsState()
+    LogsPanelContent(logs = logs, onClearLogs = onClearLogs, modifier = modifier)
+}
+
+@Composable
+private fun LogsPanelContent(
     logs: List<LogEntry>,
     onClearLogs: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+
+    // Copy/share the whole log as plain text, oldest line first so it reads like a timeline.
+    // Device details are included because most "it lags / it is silent" reports depend on them.
+    val exportLog: () -> String = {
+        buildString {
+            appendLine("Earbud Ambient Copilot - activity log (${logs.size} lines)")
+            appendLine(
+                "Device: ${Build.MANUFACTURER} ${Build.MODEL}, " +
+                    "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
+            )
+            appendLine("---")
+            logs.asReversed().forEach { entry ->
+                appendLine("[${entry.timestamp}] [${entry.tag}] ${entry.message}")
+            }
+        }
+    }
+
     // CopilotStateBus already hands us the newest entry first, but a LazyColumn anchors itself to
     // the item it is currently showing: every new line used to push the visible content down, so the
     // latest line silently slid off the top and had to be scrolled back into view. These two effects
@@ -662,6 +749,40 @@ private fun LogsPanel(
                             fontWeight = FontWeight.Medium
                         )
                     }
+                }
+                IconButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(exportLog()))
+                        Toast.makeText(context, "Activity log copied", Toast.LENGTH_SHORT).show()
+                    },
+                    enabled = logs.isNotEmpty(),
+                    modifier = Modifier.size(34.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentCopy,
+                        contentDescription = "Copy the whole activity log",
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+                IconButton(
+                    onClick = {
+                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_SUBJECT, "Earbud Ambient Copilot activity log")
+                            putExtra(Intent.EXTRA_TEXT, exportLog())
+                        }
+                        runCatching {
+                            context.startActivity(Intent.createChooser(shareIntent, "Share activity log"))
+                        }
+                    },
+                    enabled = logs.isNotEmpty(),
+                    modifier = Modifier.size(34.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Share,
+                        contentDescription = "Share the whole activity log",
+                        modifier = Modifier.size(16.dp)
+                    )
                 }
                 TextButton(onClick = onClearLogs) {
                     Text("Clear", fontSize = 11.sp)

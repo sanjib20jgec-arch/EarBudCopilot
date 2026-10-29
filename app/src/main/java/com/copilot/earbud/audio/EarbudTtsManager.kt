@@ -16,6 +16,7 @@ import com.copilot.earbud.domain.model.EarphoneConnectionState
 import com.copilot.earbud.domain.model.TtsOutcome
 import com.copilot.earbud.service.CopilotStateBus
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 import java.util.UUID
 import kotlin.coroutines.resume
@@ -37,6 +38,9 @@ class EarbudTtsManager private constructor(context: Context) : TextToSpeech.OnIn
     companion object {
         private const val MAX_INIT_ATTEMPTS = 3
         private const val INIT_RETRY_DELAY_MS = 2000L
+
+        /** Upper bound for one spoken answer, so a stuck engine can never freeze the pipeline. */
+        private const val SPEAK_TIMEOUT_MS = 20_000L
 
         @Volatile
         private var instance: EarbudTtsManager? = null
@@ -269,51 +273,67 @@ class EarbudTtsManager private constructor(context: Context) : TextToSpeech.OnIn
         audioManager.requestAudioFocus(focusRequest)
 
         return try {
-            suspendCancellableCoroutine<TtsOutcome> { continuation ->
-                val utteranceId = UUID.randomUUID().toString()
-                val deviceLabel = targetEarphone
-                    ?.productName
-                    ?.toString()
-                    ?.takeIf { it.isNotBlank() }
-                    ?: "default audio output"
+            // Hard stop: without a timeout a silent/never-finishing utterance kept the single
+            // pipeline consumer suspended forever, so the app looked frozen (mic full, no answers,
+            // no stage change) until it was force-stopped.
+            withTimeoutOrNull(SPEAK_TIMEOUT_MS) {
+                suspendCancellableCoroutine<TtsOutcome> { continuation ->
+                    val utteranceId = UUID.randomUUID().toString()
+                    val deviceLabel = targetEarphone
+                        ?.productName
+                        ?.toString()
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "default audio output"
 
-                readyEngine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {
-                        log("Speaking via $deviceLabel ...")
-                    }
-
-                    override fun onDone(id: String?) {
-                        if (id == utteranceId && continuation.isActive) {
-                            continuation.resume(TtsOutcome.SPOKEN)
+                    readyEngine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(id: String?) {
+                            log("Speaking via $deviceLabel ...")
                         }
-                    }
 
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(id: String?) {
-                        if (id == utteranceId && continuation.isActive) {
-                            log("TTS playback error.")
-                            continuation.resume(TtsOutcome.ENGINE_ERROR)
+                        override fun onDone(id: String?) {
+                            if (id == utteranceId && continuation.isActive) {
+                                continuation.resume(TtsOutcome.SPOKEN)
+                            }
                         }
-                    }
 
-                    override fun onError(id: String?, errorCode: Int) {
-                        if (id == utteranceId && continuation.isActive) {
-                            log("TTS playback error (code=$errorCode).")
-                            continuation.resume(TtsOutcome.ENGINE_ERROR)
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(id: String?) {
+                            if (id == utteranceId && continuation.isActive) {
+                                log("TTS playback error.")
+                                continuation.resume(TtsOutcome.ENGINE_ERROR)
+                            }
                         }
-                    }
-                })
 
-                val params = Bundle().apply {
-                    putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
-                    putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+                        override fun onError(id: String?, errorCode: Int) {
+                            if (id == utteranceId && continuation.isActive) {
+                                log("TTS playback error (code=$errorCode).")
+                                continuation.resume(TtsOutcome.ENGINE_ERROR)
+                            }
+                        }
+                    })
+
+                    val params = Bundle().apply {
+                        putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
+                        putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+                    }
+
+                    val speakResult = readyEngine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+                    if (speakResult == TextToSpeech.ERROR && continuation.isActive) {
+                        log("TTS engine.speak returned ERROR.")
+                        continuation.resume(TtsOutcome.ENGINE_ERROR)
+                    }
+
+                    continuation.invokeOnCancellation {
+                        runCatching { readyEngine.stop() }
+                    }
                 }
-
-                val speakResult = readyEngine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-                if (speakResult == TextToSpeech.ERROR && continuation.isActive) {
-                    log("TTS engine.speak returned ERROR.")
-                    continuation.resume(TtsOutcome.ENGINE_ERROR)
-                }
+            } ?: run {
+                runCatching { readyEngine.stop() }
+                log(
+                    "The answer did not finish speaking within ${SPEAK_TIMEOUT_MS / 1000}s " +
+                        "(engine or voice data stuck); stopped it so listening can continue."
+                )
+                TtsOutcome.ENGINE_ERROR
             }
         } finally {
             audioManager.abandonAudioFocusRequest(focusRequest)

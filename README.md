@@ -48,6 +48,28 @@ microphone -> VAD -> WAV chunk -> STT (Groq Whisper / Deepgram) -> LLM (Gemini /
 | **Transcription Language** | `Auto`, `Bengali (bn)` or `English (en)` hint sent to Whisper/Deepgram - the single biggest lever for Banglish accuracy |
 | **Whisper Model** | `Fast` (`large-v3-turbo`, lowest latency) or `Accurate` (`large-v3`) |
 
+## Performance & robustness
+
+The UI keeps a **single slow-changing state object**; the activity log, the live mic level and the
+pipeline stage are separate flows collected only by the small composables that render them, so an
+audio frame can no longer recompose the whole screen. API-key typing and the VAD slider are
+debounced and persisted off the main thread, and `AudioRecord`/VAD setup runs on `Dispatchers.IO`
+instead of blocking `onStartCommand`.
+
+The pipeline heals itself:
+
+| Failure | Behaviour |
+|---|---|
+| TTS never finishes an utterance | stopped after 20 s, answer marked failed, listening continues |
+| One utterance stalls (network) | abandoned after a 45 s budget, stage reset to listening |
+| Any exception in a stage | logged as `PIPELINE_ERR`, the consumer survives it |
+| `AudioRecord.read()` fails | backs off instead of spinning, gives up after 20 tries |
+| Microphone lost (other app, device unplugged) | capture restarted up to 3 times |
+| START pressed while "running" but capture is dead | pipeline is rebuilt (no dead button) |
+
+While the answer is spoken the mic stays open, but the voice gate is raised by 1.5x so earbud bleed
+does not re-trigger the pipeline.
+
 ## Diagnostics
 
 The app has an in-app activity log with these tags. Newest entries are on top and the panel stays
@@ -62,6 +84,8 @@ back up:
 | `STT_ERR` / `LLM_ERR` | the stage failed - the message names the cause |
 | `FILTER` | the model deliberately classified the speech as non-factual |
 | `ECHO` | ignored: the mic picked up our own answer (`SelfEchoDetector`), surrounding voices are still captured |
+| `TIMEOUT` / `PIPELINE_ERR` | an utterance exceeded its budget or a stage threw - listening continued |
+| `AUDIO_ERR` | the microphone failed; capture is restarted automatically (bounded) |
 | `PERF` | per-utterance timings in ms: STT, AI, speak and end-to-end |
 | `ANSWER` | an answer was generated (highlighted) |
 | `TTS` | spoken / blocked (no earphones) / engine not ready |

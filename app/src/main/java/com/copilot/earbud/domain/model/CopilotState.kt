@@ -86,11 +86,19 @@ data class EarphoneConnectionState(
     val deviceTypeDescription: String = "Connect Wired or Bluetooth Earbuds"
 )
 
+/**
+ * Everything the control screen renders *that changes rarely*.
+ *
+ * Deliberately excludes the live mic level and the activity log: those update ~10x/second and used
+ * to be part of this object, which forced the whole screen (dozens of chips, switches, text fields)
+ * to recompose on every audio frame - the main reason the UI felt laggy and taps were dropped.
+ * They are exposed as their own flows and collected only by the two small composables that show
+ * them. [PipelineStage] is likewise kept out and collected by the status card alone.
+ */
 data class CopilotUiState(
     val isServiceRunning: Boolean = false,
     val pipelineStage: PipelineStage = PipelineStage.IDLE,
     val earphoneState: EarphoneConnectionState = EarphoneConnectionState(),
-    val currentRmsDb: Float = 0f,
     val sttProvider: SttProvider = SttProvider.GROQ_WHISPER,
     val llmProvider: LlmProvider = LlmProvider.GEMINI_FLASH,
 
@@ -105,6 +113,5 @@ data class CopilotUiState(
     val keepListeningDuringTts: Boolean = true,
     val sttLanguage: SttLanguage = SttLanguage.AUTO,
     val whisperMode: WhisperMode = WhisperMode.FAST,
-    val isBatteryOptimizationIgnored: Boolean = false,
-    val logs: List<LogEntry> = emptyList()
+    val isBatteryOptimizationIgnored: Boolean = false
 )
