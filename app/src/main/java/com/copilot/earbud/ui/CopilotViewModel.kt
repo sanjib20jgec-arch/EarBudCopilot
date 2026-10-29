@@ -14,22 +14,28 @@ import com.copilot.earbud.data.remote.AiBrainRepository
 import com.copilot.earbud.domain.model.BrainDecision
 import com.copilot.earbud.domain.model.CopilotUiState
 import com.copilot.earbud.domain.model.LlmProvider
+import com.copilot.earbud.domain.model.LogEntry
+import com.copilot.earbud.domain.model.PipelineStage
 import com.copilot.earbud.domain.model.SttLanguage
 import com.copilot.earbud.domain.model.SttProvider
 import com.copilot.earbud.domain.model.TtsOutcome
 import com.copilot.earbud.domain.model.WhisperMode
 import com.copilot.earbud.service.AmbientListeningService
 import com.copilot.earbud.service.CopilotStateBus
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class CopilotViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val prefs = SettingsPreferences(application)
+    private val prefs = SettingsPreferences.get(application)
     private val aiBrainRepository = AiBrainRepository()
 
     /**
@@ -53,60 +59,71 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
     private val _whisperMode = MutableStateFlow(prefs.whisperMode)
     private val _batteryOptIgnored = MutableStateFlow(checkBatteryOptimizationIgnored())
 
+    // Debounced persistence (see the key / slider setters below).
+    private var groqKeySaveJob: Job? = null
+    private var deepgramKeySaveJob: Job? = null
+    private var geminiKeySaveJob: Job? = null
+    private var vadSaveJob: Job? = null
+    private var keepListeningSaveJob: Job? = null
+
+    private var pendingGroqKey: String? = null
+    private var pendingDeepgramKey: String? = null
+    private var pendingGeminiKey: String? = null
+
+    /**
+     * Live values the UI needs but that change many times per second. They are exposed as their own
+     * flows so only the tiny composables that display them recompose.
+     */
+    val logs: StateFlow<List<LogEntry>> = CopilotStateBus.logs
+    val rms: StateFlow<Float> = CopilotStateBus.currentRms
+    val pipelineStage: StateFlow<PipelineStage> = CopilotStateBus.pipelineStage
+
+    private val providerSelection = combine(
+        _sttProvider,
+        _llmProvider,
+        _groqKeySet,
+        _deepgramKeySet,
+        _geminiKeySet
+    ) { stt, llm, groq, dg, gemini ->
+        Tuple5(stt, llm, groq, dg, gemini)
+    }
+
+    private val pipelineSettings = combine(
+        _vadThreshold,
+        _requireEarphones,
+        _keepListeningDuringTts,
+        _sttLanguage,
+        _whisperMode
+    ) { vad, earphones, keepListening, language, whisper ->
+        Settings5(vad, earphones, keepListening, language, whisper)
+    }
+
+    /**
+     * Only slow-changing values live here. The activity log, the live RMS level and the pipeline
+     * stage are NOT part of it: while they were, every audio frame and every log line recomposed the
+     * entire screen and made taps feel unresponsive.
+     */
     val uiState: StateFlow<CopilotUiState> = combine(
         CopilotStateBus.isServiceRunning,
-        CopilotStateBus.pipelineStage,
         CopilotStateBus.earphoneState,
-        CopilotStateBus.currentRms,
-        CopilotStateBus.logs
-    ) { running, stage, earphone, rms, logs ->
+        providerSelection,
+        pipelineSettings,
+        _batteryOptIgnored
+    ) { running, earphone, providers, settings, batteryIgnored ->
         CopilotUiState(
             isServiceRunning = running,
-            pipelineStage = stage,
             earphoneState = earphone,
-            currentRmsDb = rms,
-            sttProvider = _sttProvider.value,
-            llmProvider = _llmProvider.value,
-            groqKeySet = _groqKeySet.value,
-            deepgramKeySet = _deepgramKeySet.value,
-            geminiKeySet = _geminiKeySet.value,
-            vadThresholdRms = _vadThreshold.value,
-            requireEarphonesForTts = _requireEarphones.value,
-            isBatteryOptimizationIgnored = _batteryOptIgnored.value,
-            logs = logs
-        )
-    }.combine(
-        combine(
-            combine(
-                _sttProvider,
-                _llmProvider,
-                _groqKeySet,
-                _deepgramKeySet,
-                _geminiKeySet
-            ) { stt, llm, groq, dg, gemini ->
-                Tuple5(stt, llm, groq, dg, gemini)
-            },
-            combine(
-                _keepListeningDuringTts,
-                _sttLanguage,
-                _whisperMode
-            ) { keepListening, language, whisper -> Triple(keepListening, language, whisper) }
-        ) { keys, listening -> keys to listening }
-    ) { base, pair ->
-        val keys = pair.first
-        val listening = pair.second
-        base.copy(
-            sttProvider = keys.a,
-            llmProvider = keys.b,
-            groqKeySet = keys.c,
-            deepgramKeySet = keys.d,
-            geminiKeySet = keys.e,
-            vadThresholdRms = _vadThreshold.value,
-            requireEarphonesForTts = _requireEarphones.value,
-            keepListeningDuringTts = listening.first,
-            sttLanguage = listening.second,
-            whisperMode = listening.third,
-            isBatteryOptimizationIgnored = _batteryOptIgnored.value
+            sttProvider = providers.a,
+            llmProvider = providers.b,
+            groqKeySet = providers.c,
+            deepgramKeySet = providers.d,
+            geminiKeySet = providers.e,
+            vadThresholdRms = settings.vad,
+            requireEarphonesForTts = settings.earphones,
+            keepListeningDuringTts = settings.keepListening,
+            sttLanguage = settings.language,
+            whisperMode = settings.whisper,
+            isBatteryOptimizationIgnored = batteryIgnored
         )
     }.stateIn(
         scope = viewModelScope,
@@ -114,18 +131,64 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
         initialValue = CopilotUiState()
     )
 
+    // Typing an API key used to encrypt+write the whole encrypted preferences file and rebuild the
+    // UI state on every single keystroke, which made the keyboard feel sticky. The "key is set" flag
+    // now updates instantly while the encrypted write is debounced and runs off the main thread.
     fun updateGroqApiKey(key: String) {
-        prefs.groqApiKey = key
-        _groqKeySet.value = prefs.hasGroqKey
+        pendingGroqKey = key
+        updateKeySetFlag(_groqKeySet, key)
+        groqKeySaveJob?.cancel()
+        groqKeySaveJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(KEY_SAVE_DEBOUNCE_MS)
+            prefs.groqApiKey = key
+            pendingGroqKey = null
+            _groqKeySet.value = prefs.hasGroqKey
+        }
     }
 
     fun updateDeepgramApiKey(key: String) {
-        prefs.deepgramApiKey = key
-        _deepgramKeySet.value = prefs.hasDeepgramKey
+        pendingDeepgramKey = key
+        updateKeySetFlag(_deepgramKeySet, key)
+        deepgramKeySaveJob?.cancel()
+        deepgramKeySaveJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(KEY_SAVE_DEBOUNCE_MS)
+            prefs.deepgramApiKey = key
+            pendingDeepgramKey = null
+            _deepgramKeySet.value = prefs.hasDeepgramKey
+        }
     }
 
     fun updateGeminiApiKey(key: String) {
-        prefs.geminiApiKey = key
+        pendingGeminiKey = key
+        updateKeySetFlag(_geminiKeySet, key)
+        geminiKeySaveJob?.cancel()
+        geminiKeySaveJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(KEY_SAVE_DEBOUNCE_MS)
+            prefs.geminiApiKey = key
+            pendingGeminiKey = null
+            _geminiKeySet.value = prefs.hasGeminiKey
+        }
+    }
+
+    private fun updateKeySetFlag(target: MutableStateFlow<Boolean>, typed: String) {
+        val isSet = typed.isNotBlank()
+        if (target.value != isSet) target.value = isSet
+    }
+
+    /**
+     * Persists any debounced key immediately. Called right before START so the pre-flight key check
+     * never sees a stale value (that used to make the START button appear dead when the last
+     * character had just been typed).
+     */
+    private fun flushPendingKeySaves() {
+        groqKeySaveJob?.cancel()
+        deepgramKeySaveJob?.cancel()
+        geminiKeySaveJob?.cancel()
+        pendingGroqKey?.let { prefs.groqApiKey = it; pendingGroqKey = null }
+        pendingDeepgramKey?.let { prefs.deepgramApiKey = it; pendingDeepgramKey = null }
+        pendingGeminiKey?.let { prefs.geminiApiKey = it; pendingGeminiKey = null }
+        _groqKeySet.value = prefs.hasGroqKey
+        _deepgramKeySet.value = prefs.hasDeepgramKey
         _geminiKeySet.value = prefs.hasGeminiKey
     }
 
@@ -139,10 +202,20 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
         _llmProvider.value = provider
     }
 
+    /**
+     * Called on every slider movement, so it must stay dirt cheap: the value is published to the UI
+     * immediately while the preferences write - and the startService() round-trip that applies it to
+     * the running pipeline - are debounced. Previously each drag event did both on the main thread.
+     */
     fun updateVadThreshold(threshold: Float) {
-        prefs.vadThresholdRms = threshold
+        if (_vadThreshold.value == threshold) return
         _vadThreshold.value = threshold
-        notifyServiceConfigUpdated()
+        vadSaveJob?.cancel()
+        vadSaveJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(CONFIG_SAVE_DEBOUNCE_MS)
+            prefs.vadThresholdRms = threshold
+            notifyServiceConfigUpdated()
+        }
     }
 
     fun setRequireEarphones(require: Boolean) {
@@ -152,9 +225,13 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
 
     /** Mic stays open while the answer is spoken (self-echo is filtered, not the microphone). */
     fun setKeepListeningDuringTts(keep: Boolean) {
-        prefs.keepListeningDuringTts = keep
         _keepListeningDuringTts.value = keep
-        notifyServiceConfigUpdated()
+        keepListeningSaveJob?.cancel()
+        keepListeningSaveJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(CONFIG_SAVE_DEBOUNCE_MS)
+            prefs.keepListeningDuringTts = keep
+            notifyServiceConfigUpdated()
+        }
     }
 
     fun selectSttLanguage(language: SttLanguage) {
@@ -182,12 +259,24 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
             val stopIntent = Intent(context, AmbientListeningService::class.java).apply {
                 action = AmbientListeningService.ACTION_STOP
             }
-            context.startService(stopIntent)
+            runCatching { context.startService(stopIntent) }
+                .onFailure {
+                    CopilotStateBus.log(
+                        "SERVICE",
+                        "Could not deliver the stop request: ${it.message}",
+                        isError = true
+                    )
+                }
         } else {
+            // Do not let a debounced key write make the pre-flight check see a stale value.
+            flushPendingKeySaves()
+
             // Pre-flight: do not enter a listening state that is guaranteed to never answer.
             val configIssue = prefs.configIssue()
             if (configIssue != null) {
                 CopilotStateBus.log("CONFIG", "Not started: $configIssue", isError = true)
+                // Show it in the stage pill too, otherwise a refused start looks like a dead button.
+                CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
                 Toast.makeText(context, configIssue, Toast.LENGTH_LONG).show()
                 return
             }
@@ -195,10 +284,19 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
             val startIntent = Intent(context, AmbientListeningService::class.java).apply {
                 action = AmbientListeningService.ACTION_START
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(startIntent)
-            } else {
-                context.startService(startIntent)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(startIntent)
+                } else {
+                    context.startService(startIntent)
+                }
+            }.onFailure {
+                CopilotStateBus.log(
+                    "SERVICE",
+                    "Could not start the listening service: ${it.message}",
+                    isError = true
+                )
+                CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
             }
         }
     }
@@ -229,10 +327,12 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
                 }
                 is BrainDecision.Answer -> {
                     CopilotStateBus.log("ANSWER", decision.text, isHighlight = true)
-                    val outcome = ttsManager.whisperToEarbuds(
-                        text = decision.text,
-                        requireEarphones = prefs.requireEarphonesForTts
-                    )
+                    val outcome = withContext(Dispatchers.Default) {
+                        ttsManager.whisperToEarbuds(
+                            text = decision.text,
+                            requireEarphones = prefs.requireEarphonesForTts
+                        )
+                    }
                     CopilotStateBus.log(
                         "TTS",
                         when (outcome) {
@@ -289,13 +389,20 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
         CopilotStateBus.clearLogs()
     }
 
+    /** Runs on an IO thread now (debounced), so a background-start failure must not crash. */
     private fun notifyServiceConfigUpdated() {
         if (!CopilotStateBus.isServiceRunning.value) return
         val context = getApplication<Application>()
         val intent = Intent(context, AmbientListeningService::class.java).apply {
             action = AmbientListeningService.ACTION_UPDATE_CONFIG
         }
-        context.startService(intent)
+        runCatching { context.startService(intent) }
+            .onFailure { CopilotStateBus.log("SERVICE", "Config update not delivered: ${it.message}") }
+    }
+
+    companion object {
+        private const val KEY_SAVE_DEBOUNCE_MS = 400L
+        private const val CONFIG_SAVE_DEBOUNCE_MS = 250L
     }
 
     override fun onCleared() {
@@ -305,4 +412,12 @@ class CopilotViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private data class Tuple5<A, B, C, D, E>(val a: A, val b: B, val c: C, val d: D, val e: E)
+
+    private data class Settings5<A, B, C, D, E>(
+        val vad: A,
+        val earphones: B,
+        val keepListening: C,
+        val language: D,
+        val whisper: E
+    )
 }

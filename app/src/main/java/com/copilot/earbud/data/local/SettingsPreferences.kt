@@ -158,6 +158,20 @@ class SettingsPreferences(context: Context) {
     }
 
     companion object {
+
+        @Volatile
+        private var instance: SettingsPreferences? = null
+
+        /**
+         * Process-wide instance. Creating [EncryptedSharedPreferences] touches the Android Keystore
+         * and re-parses the file (~tens of ms); the ViewModel, the service and the boot receiver all
+         * need settings, so build it once instead of three times per process start.
+         */
+        fun get(context: Context): SettingsPreferences =
+            instance ?: synchronized(this) {
+                instance ?: SettingsPreferences(context.applicationContext).also { instance = it }
+            }
+
         private const val TAG = "SettingsPreferences"
 
         private const val LEGACY_PREFS_FILE = "earbud_copilot_prefs"

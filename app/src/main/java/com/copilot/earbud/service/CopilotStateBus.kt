@@ -30,6 +30,12 @@ object CopilotStateBus {
     private val _earphoneState = MutableStateFlow(EarphoneConnectionState())
     val earphoneState: StateFlow<EarphoneConnectionState> = _earphoneState.asStateFlow()
 
+    private const val RMS_MIN_DELTA = 6f
+    private const val RMS_MIN_INTERVAL_MS = 200L
+
+    @Volatile
+    private var lastRmsPublishMs = 0L
+
     private val _logs = MutableStateFlow<List<LogEntry>>(emptyList())
     val logs: StateFlow<List<LogEntry>> = _logs.asStateFlow()
 
@@ -45,7 +51,17 @@ object CopilotStateBus {
         _pipelineStage.value = stage
     }
 
+    /**
+     * Publishes the live mic level, but not for every audio frame: a new value is emitted only when
+     * it moved noticeably or the last one is older than [RMS_MIN_INTERVAL_MS]. Without this the
+     * level meter alone woke the UI ~10x/second for a number nobody can read that fast.
+     */
     fun updateRms(rms: Float) {
+        val previous = _currentRms.value
+        val now = System.currentTimeMillis()
+        val movedEnough = kotlin.math.abs(rms - previous) >= RMS_MIN_DELTA
+        if (!movedEnough && now - lastRmsPublishMs < RMS_MIN_INTERVAL_MS) return
+        lastRmsPublishMs = now
         _currentRms.value = rms
     }
 

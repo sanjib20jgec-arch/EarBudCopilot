@@ -25,7 +25,7 @@ class BootResumeReceiver : BroadcastReceiver() {
             return
         }
 
-        val prefs = SettingsPreferences(context)
+        val prefs = SettingsPreferences.get(context)
         if (!prefs.resumeAfterBoot) return
         if (prefs.configIssue() != null) return
 

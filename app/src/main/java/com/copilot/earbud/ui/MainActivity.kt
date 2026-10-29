@@ -39,9 +39,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import com.copilot.earbud.domain.model.CopilotUiState
 import com.copilot.earbud.domain.model.LlmProvider
@@ -72,6 +74,9 @@ class MainActivity : ComponentActivity() {
                 val state by viewModel.uiState.collectAsState()
                 CopilotControlScreen(
                     state = state,
+                    stageFlow = viewModel.pipelineStage,
+                    rmsFlow = viewModel.rms,
+                    logsFlow = viewModel.logs,
                     onToggleService = { viewModel.toggleService() },
                     onSttProviderChange = viewModel::selectSttProvider,
                     onLlmProviderChange = viewModel::selectLlmProvider,
@@ -112,6 +117,9 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun CopilotControlScreen(
     state: CopilotUiState,
+    stageFlow: StateFlow<PipelineStage>,
+    rmsFlow: StateFlow<Float>,
+    logsFlow: StateFlow<List<LogEntry>>,
     onToggleService: () -> Unit,
     onSttProviderChange: (SttProvider) -> Unit,
     onLlmProviderChange: (LlmProvider) -> Unit,
@@ -210,6 +218,8 @@ fun CopilotControlScreen(
             // 1. Earphone Connection & Pipeline Status Banner
             StatusHeaderCard(
                 state = state,
+                stageFlow = stageFlow,
+                rmsFlow = rmsFlow,
                 onToggleClick = {
                     val hasMic = ContextCompat.checkSelfPermission(
                         context,
@@ -341,10 +351,9 @@ fun CopilotControlScreen(
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Text("VAD Voice Trigger Threshold", fontSize = 12.sp)
-                                Text(
-                                    "RMS: ${state.vadThresholdRms.toInt()} (Live: ${state.currentRmsDb.toInt()})",
-                                    fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.secondary
+                                VadThresholdLabels(
+                                    threshold = state.vadThresholdRms,
+                                    rmsFlow = rmsFlow
                                 )
                             }
                             Slider(
@@ -456,7 +465,7 @@ fun CopilotControlScreen(
 
             // 4. Real-Time Pipeline Status Logs
             LogsPanel(
-                logs = state.logs,
+                logsFlow = logsFlow,
                 onClearLogs = onClearLogs,
                 modifier = Modifier.weight(1f)
             )
@@ -467,6 +476,8 @@ fun CopilotControlScreen(
 @Composable
 private fun StatusHeaderCard(
     state: CopilotUiState,
+    stageFlow: StateFlow<PipelineStage>,
+    rmsFlow: StateFlow<Float>,
     onToggleClick: () -> Unit
 ) {
     val buttonColor by animateColorAsState(
@@ -532,58 +543,89 @@ private fun StatusHeaderCard(
                 }
             }
 
-            // Pipeline Stage Pill
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF0F172A))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Stage: ${state.pipelineStage.name}",
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = when (state.pipelineStage) {
-                        PipelineStage.SPEECH_DETECTED -> Color(0xFFFACC15)
-                        PipelineStage.WHISPERING_TTS -> Color(0xFF4ADE80)
-                        PipelineStage.FILTERED -> Color(0xFF94A3B8)
-                        PipelineStage.ERROR,
-                        PipelineStage.TTS_FAILED -> Color(0xFFF87171)
-                        PipelineStage.TTS_BLOCKED -> Color(0xFFF59E0B)
-                        else -> Color(0xFF38BDF8)
-                    }
-                )
-                Text(
-                    text = "Mic RMS: ${state.currentRmsDb.toInt()}",
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = Color(0xFF94A3B8)
-                )
-            }
-
-            // One-line explanation for the states where nothing was heard on purpose / on failure.
-            val stageHint = when (state.pipelineStage) {
-                PipelineStage.ERROR -> "Last attempt failed - read the red line in the activity log."
-                PipelineStage.FILTERED -> "The AI decided this was not a factual question."
-                PipelineStage.TTS_BLOCKED -> "Answer ready but not spoken: no earphones detected (strict mode)."
-                PipelineStage.TTS_FAILED -> "Answer ready but the TTS engine could not speak it."
-                else -> null
-            }
-            if (stageHint != null) {
-                Text(
-                    text = stageHint,
-                    fontSize = 11.sp,
-                    color = when (state.pipelineStage) {
-                        PipelineStage.FILTERED -> Color(0xFF94A3B8)
-                        else -> Color(0xFFF87171)
-                    }
-                )
-            }
+            // Pipeline stage and live level change many times per second, so they collect their
+            // own flows: only these two small composables recompose, not the whole screen.
+            StagePill(stageFlow = stageFlow, rmsFlow = rmsFlow)
+            StageHint(stageFlow = stageFlow)
         }
     }
+}
+
+@Composable
+private fun StagePill(stageFlow: StateFlow<PipelineStage>, rmsFlow: StateFlow<Float>) {
+    val stage by stageFlow.collectAsState()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color(0xFF0F172A))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "Stage: ${stage.name}",
+            fontSize = 12.sp,
+            fontFamily = FontFamily.Monospace,
+            color = when (stage) {
+                PipelineStage.SPEECH_DETECTED -> Color(0xFFFACC15)
+                PipelineStage.WHISPERING_TTS -> Color(0xFF4ADE80)
+                PipelineStage.FILTERED -> Color(0xFF94A3B8)
+                PipelineStage.ERROR,
+                PipelineStage.TTS_FAILED -> Color(0xFFF87171)
+                PipelineStage.TTS_BLOCKED -> Color(0xFFF59E0B)
+                else -> Color(0xFF38BDF8)
+            }
+        )
+        LiveRmsText(rmsFlow = rmsFlow, prefix = "Mic RMS: ")
+    }
+}
+
+/** One-line explanation for the states where nothing was heard on purpose / on failure. */
+@Composable
+private fun StageHint(stageFlow: StateFlow<PipelineStage>) {
+    val stage by stageFlow.collectAsState()
+    val stageHint = when (stage) {
+        PipelineStage.ERROR -> "Last attempt failed - read the red line in the activity log."
+        PipelineStage.FILTERED -> "The AI decided this was not a factual question."
+        PipelineStage.TTS_BLOCKED -> "Answer ready but not spoken: no earphones detected (strict mode)."
+        PipelineStage.TTS_FAILED -> "Answer ready but the TTS engine could not speak it."
+        else -> null
+    }
+    if (stageHint != null) {
+        Text(
+            text = stageHint,
+            fontSize = 11.sp,
+            color = if (stage == PipelineStage.FILTERED) Color(0xFF94A3B8) else Color(0xFFF87171)
+        )
+    }
+}
+
+/** Live microphone level; recomposes on its own every few hundred milliseconds. */
+@Composable
+private fun LiveRmsText(
+    rmsFlow: StateFlow<Float>,
+    prefix: String,
+    fontSize: TextUnit = 12.sp,
+    color: Color = Color(0xFF94A3B8)
+) {
+    val rms by rmsFlow.collectAsState()
+    Text(
+        text = "$prefix${rms.toInt()}",
+        fontSize = fontSize,
+        fontFamily = FontFamily.Monospace,
+        color = color
+    )
+}
+
+@Composable
+private fun VadThresholdLabels(threshold: Float, rmsFlow: StateFlow<Float>) {
+    val rms by rmsFlow.collectAsState()
+    Text(
+        text = "RMS: ${threshold.toInt()} (Live: ${rms.toInt()})",
+        fontSize = 12.sp,
+        color = MaterialTheme.colorScheme.secondary
+    )
 }
 
 @Composable
@@ -607,6 +649,18 @@ private fun QuickTestBar(onSimulateTranscript: (String) -> Unit) {
 
 @Composable
 private fun LogsPanel(
+    logsFlow: StateFlow<List<LogEntry>>,
+    onClearLogs: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    // The log changes on every pipeline event; collecting it here keeps that churn out of the
+    // control screen's recomposition scope.
+    val logs by logsFlow.collectAsState()
+    LogsPanelContent(logs = logs, onClearLogs = onClearLogs, modifier = modifier)
+}
+
+@Composable
+private fun LogsPanelContent(
     logs: List<LogEntry>,
     onClearLogs: () -> Unit,
     modifier: Modifier = Modifier

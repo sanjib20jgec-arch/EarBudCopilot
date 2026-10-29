@@ -8,6 +8,7 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -27,12 +28,51 @@ class AudioCaptureManager(
     private val onUtteranceCaptured: suspend (ByteArray, Float, Boolean) -> Unit,
     private val onError: (String) -> Unit
 ) {
+    /**
+     * Growable 16-bit PCM buffer.
+     *
+     * The utterance used to be accumulated in an `ArrayList<Short>`, which boxes every one of the
+     * ~96,000 samples of a six-second chunk (~1.5 MB of short-lived objects per utterance). The GC
+     * pauses that produced were visible as UI stutter and as dropped speech chunks on slower phones.
+     */
+    private class PcmBuffer(initialCapacity: Int = SAMPLE_RATE * 8) {
+        private var data = ShortArray(initialCapacity)
+
+        var size = 0
+            private set
+
+        val isEmpty: Boolean get() = size == 0
+
+        fun clear() {
+            size = 0
+        }
+
+        fun addAll(source: ShortArray, count: Int = source.size) {
+            ensureCapacity(count)
+            source.copyInto(data, size, 0, count)
+            size += count
+        }
+
+        fun toShortArray(): ShortArray = data.copyOf(size)
+
+        private fun ensureCapacity(extra: Int) {
+            if (size + extra <= data.size) return
+            var newSize = data.size * 2
+            while (newSize < size + extra) newSize *= 2
+            data = data.copyOf(newSize)
+        }
+    }
+
     companion object {
         const val SAMPLE_RATE = 16000
         private const val FRAME_SAMPLES = 512 // 32ms per frame at 16kHz
         private const val PRE_ROLL_FRAMES = 12 // ~384ms pre-roll before speech trigger
         // 800ms of trailing silence used to be spent before transcription even started; 550ms is
         // still comfortably longer than a natural inter-word pause but cuts ~250ms off every answer.
+        /** Give up on the microphone after this many consecutive failed reads. */
+        private const val MAX_CONSECUTIVE_READ_ERRORS = 20
+        private const val READ_ERROR_BACKOFF_MS = 50L
+
         private const val SILENCE_TAIL_MS = 550L
         private const val MIN_SPEECH_DURATION_MS = 650L // Ignore tiny clicks/coughs < 650ms
         private const val MAX_SPEECH_DURATION_MS = 10000L // Force-dispatch chunk at 10 seconds
@@ -102,18 +142,41 @@ class AudioCaptureManager(
             val frameBuffer = ShortArray(FRAME_SAMPLES)
             val preRollQueue = ArrayDeque<ShortArray>(PRE_ROLL_FRAMES)
             val speechVotes = ArrayDeque<Boolean>(SPEECH_VOTE_WINDOW)
-            val activeSpeechPcm = ArrayList<Short>(SAMPLE_RATE * 6)
+            val activeSpeechPcm = PcmBuffer(SAMPLE_RATE * 6)
 
             var isCurrentlySpeaking = false
             var utteranceOverlapsTts = false
             var speechStartTimestampMs = 0L
             var lastVoiceTimestampMs = 0L
             var uiRmsThrottleCounter = 0
+            var consecutiveReadErrors = 0
 
             try {
                 while (isActive) {
                     val readCount = recorder.read(frameBuffer, 0, FRAME_SAMPLES)
-                    if (readCount <= 0) continue
+                    if (readCount < 0) {
+                        // A failed read (mic taken by another app, device unplugged, dead object)
+                        // used to `continue` straight away, turning this loop into a 100% CPU spin
+                        // that starved the UI thread. Back off, and give up after a few failures.
+                        consecutiveReadErrors++
+                        if (consecutiveReadErrors == 1) {
+                            onError("Microphone read failed (code $readCount); retrying...")
+                        }
+                        if (consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS) {
+                            onError(
+                                "Microphone stopped delivering audio (code $readCount). " +
+                                    "Another app may be using the microphone."
+                            )
+                            break
+                        }
+                        delay(READ_ERROR_BACKOFF_MS)
+                        continue
+                    }
+                    if (readCount == 0) {
+                        delay(READ_ERROR_BACKOFF_MS)
+                        continue
+                    }
+                    consecutiveReadErrors = 0
 
                     // While the answer is being spoken we normally KEEP capturing, so a question
                     // asked during the reply is not lost. The utterance is flagged and the service
@@ -157,12 +220,12 @@ class AudioCaptureManager(
                             // Prepend pre-roll frames so the first consonant of a Banglish word isn't clipped
                             activeSpeechPcm.clear()
                             for (preFrame in preRollQueue) {
-                                for (s in preFrame) activeSpeechPcm.add(s)
+                                activeSpeechPcm.addAll(preFrame)
                             }
                             preRollQueue.clear()
                         }
                         lastVoiceTimestampMs = now
-                        for (s in frameCopy) activeSpeechPcm.add(s)
+                        activeSpeechPcm.addAll(frameCopy)
 
                         // Force-finalize if continuous speech reaches max window (10s)
                         if (now - speechStartTimestampMs >= MAX_SPEECH_DURATION_MS) {
@@ -172,7 +235,7 @@ class AudioCaptureManager(
                         }
                     } else {
                         if (isCurrentlySpeaking) {
-                            for (s in frameCopy) activeSpeechPcm.add(s)
+                            activeSpeechPcm.addAll(frameCopy)
                             val silenceElapsed = now - lastVoiceTimestampMs
                             if (silenceElapsed >= SILENCE_TAIL_MS) {
                                 val totalSpeechDuration = lastVoiceTimestampMs - speechStartTimestampMs
@@ -204,15 +267,12 @@ class AudioCaptureManager(
     }
 
     private suspend fun finalizeAndDispatch(
-        pcmList: ArrayList<Short>,
+        pcmList: PcmBuffer,
         durationMs: Long,
         overlapsTts: Boolean
     ) {
-        if (pcmList.isEmpty()) return
-        val shorts = ShortArray(pcmList.size)
-        for (i in pcmList.indices) {
-            shorts[i] = pcmList[i]
-        }
+        if (pcmList.isEmpty) return
+        val shorts = pcmList.toShortArray()
         pcmList.clear()
         val wavBytes = WavEncoder.encodePcm16MonoToWav(shorts, SAMPLE_RATE)
         val durationSec = durationMs / 1000f

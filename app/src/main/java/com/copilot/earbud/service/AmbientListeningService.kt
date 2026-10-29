@@ -27,9 +27,11 @@ import com.copilot.earbud.ui.MainActivity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
@@ -47,6 +49,12 @@ class AmbientListeningService : Service() {
         const val ACTION_UPDATE_CONFIG = "com.copilot.earbud.action.UPDATE_CONFIG"
         private const val NOTIFICATION_ID = 1001
         private const val SELF_ECHO_WINDOW_MS = 20000L
+
+        /** Wall-clock budget for one utterance (STT + AI + spoken answer). */
+        private const val UTTERANCE_BUDGET_MS = 45_000L
+
+        private const val MAX_CAPTURE_RESTARTS = 3
+        private const val CAPTURE_RESTART_DELAY_MS = 1_500L
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -65,6 +73,12 @@ class AmbientListeningService : Service() {
      * `ttsSpeaking` flag and flush each other's speech.
      */
     private var utteranceQueue = Channel<CapturedUtterance>(capacity = 4)
+
+    @Volatile
+    private var captureStarting = false
+
+    @Volatile
+    private var captureRestartAttempts = 0
     private var pipelineJob: Job? = null
 
     @Volatile
@@ -81,7 +95,7 @@ class AmbientListeningService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        prefs = SettingsPreferences(this)
+        prefs = SettingsPreferences.get(this)
 
         // Process-wide singleton: the UI's "Quick Test" button shares this exact engine.
         earbudTtsManager = EarbudTtsManager.get(this)
@@ -95,9 +109,10 @@ class AmbientListeningService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_UPDATE_CONFIG -> {
+                // Cheap on purpose: this runs on the main thread and used to also re-query the audio
+                // devices (a binder round-trip) for every slider tick.
                 audioCaptureManager?.setVadThreshold(prefs.vadThresholdRms)
                 audioCaptureManager?.keepListeningDuringTts = prefs.keepListeningDuringTts
-                earbudTtsManager?.refreshEarphoneStatus()
                 return START_STICKY
             }
             else -> {
@@ -117,7 +132,21 @@ class AmbientListeningService : Service() {
     }
 
     private fun startAmbientCopilot() {
-        if (CopilotStateBus.isServiceRunning.value) return
+        if (CopilotStateBus.isServiceRunning.value) {
+            // Self-heal: the flag says we are listening but the capture pipeline is gone (audio
+            // device lost, capture loop died). Previously this returned silently, so pressing START
+            // did nothing at all - the classic "the button is dead" symptom.
+            if (audioCaptureManager == null) {
+                CopilotStateBus.log(
+                    "SERVICE",
+                    "Pipeline was not running - restarting audio capture."
+                )
+                startCapturePipeline()
+            } else {
+                CopilotStateBus.log("SERVICE", "Already listening.")
+            }
+            return
+        }
 
         // 1. Promote to Foreground Service with FOREGROUND_SERVICE_TYPE_MICROPHONE (Android 14 / SDK 34+)
         val notification = buildNotification("Listening passively for Banglish questions...")
@@ -157,45 +186,136 @@ class AmbientListeningService : Service() {
         utteranceQueue = Channel(capacity = 4)
         startPipelineConsumer()
 
-        val capture = AudioCaptureManager(
-            context = this,
-            scope = serviceScope,
-            initialRmsThreshold = prefs.vadThresholdRms,
-            onRmsUpdate = { rms ->
-                CopilotStateBus.updateRms(rms)
-            },
-            onSpeechStateChanged = { isSpeaking ->
-                if (isSpeaking) {
-                    CopilotStateBus.setPipelineStage(PipelineStage.SPEECH_DETECTED)
-                } else if (CopilotStateBus.pipelineStage.value == PipelineStage.SPEECH_DETECTED) {
-                    CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
-                }
-            },
-            onUtteranceCaptured = { wavBytes, durationSec, overlapsTts ->
-                val queued = utteranceQueue.trySend(CapturedUtterance(wavBytes, durationSec, overlapsTts))
-                if (queued.isFailure) {
-                    CopilotStateBus.log("VAD", "Pipeline busy - speech chunk dropped (queue full).", isError = true)
-                }
-            },
-            onError = { errMsg ->
+        startCapturePipeline()
+    }
+
+    /**
+     * Builds the AudioRecord, the VAD (which may load an ONNX model) and the echo canceller on a
+     * background thread. Doing it inline in onStartCommand blocked the main thread for hundreds of
+     * milliseconds whenever START was pressed, which felt like the whole UI had frozen.
+     */
+    private fun startCapturePipeline() {
+        if (captureStarting) return
+        captureStarting = true
+
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                val capture = AudioCaptureManager(
+                    context = this@AmbientListeningService,
+                    scope = serviceScope,
+                    initialRmsThreshold = prefs.vadThresholdRms,
+                    onRmsUpdate = { rms ->
+                        CopilotStateBus.updateRms(rms)
+                    },
+                    onSpeechStateChanged = { isSpeaking ->
+                        if (isSpeaking) {
+                            CopilotStateBus.setPipelineStage(PipelineStage.SPEECH_DETECTED)
+                        } else if (CopilotStateBus.pipelineStage.value == PipelineStage.SPEECH_DETECTED) {
+                            CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
+                        }
+                    },
+                    onUtteranceCaptured = { wavBytes, durationSec, overlapsTts ->
+                        val queued = utteranceQueue.trySend(
+                            CapturedUtterance(wavBytes, durationSec, overlapsTts)
+                        )
+                        if (queued.isFailure) {
+                            CopilotStateBus.log(
+                                "VAD",
+                                "Pipeline busy - speech chunk dropped (queue full).",
+                                isError = true
+                            )
+                        }
+                    },
+                    onError = { errMsg ->
+                        CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
+                        CopilotStateBus.log("AUDIO_ERR", errMsg, isError = true)
+                        scheduleCaptureRestart()
+                    }
+                )
+                capture.keepListeningDuringTts = prefs.keepListeningDuringTts
+                audioCaptureManager = capture
+                capture.startCapture()
+                captureRestartAttempts = 0
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (t: Throwable) {
+                CopilotStateBus.log(
+                    "AUDIO_ERR",
+                    "Could not start audio capture: ${t.message ?: t.toString()}",
+                    isError = true
+                )
                 CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
-                CopilotStateBus.log("AUDIO_ERR", errMsg, isError = true)
+            } finally {
+                captureStarting = false
             }
-        )
-        capture.keepListeningDuringTts = prefs.keepListeningDuringTts
-        audioCaptureManager = capture
-        capture.startCapture()
+        }
+    }
+
+    /**
+     * Bounded self-healing for the microphone: a Bluetooth earbud reconnecting or another app
+     * grabbing the mic used to kill the capture loop for the rest of the session (the app looked
+     * alive but heard nothing). Restart it a few times with a delay, then stop trying and show it.
+     */
+    private fun scheduleCaptureRestart() {
+        if (captureRestartAttempts >= MAX_CAPTURE_RESTARTS) {
+            CopilotStateBus.log(
+                "SERVICE",
+                "Audio capture keeps failing - press STOP and START again to recover.",
+                isError = true
+            )
+            return
+        }
+        captureRestartAttempts++
+        serviceScope.launch {
+            delay(CAPTURE_RESTART_DELAY_MS)
+            if (!CopilotStateBus.isServiceRunning.value) return@launch
+            CopilotStateBus.log(
+                "SERVICE",
+                "Restarting audio capture (attempt $captureRestartAttempts/$MAX_CAPTURE_RESTARTS)."
+            )
+            audioCaptureManager?.stopCapture()
+            audioCaptureManager = null
+            startCapturePipeline()
+        }
     }
 
     private fun startPipelineConsumer() {
         if (pipelineJob?.isActive == true) return
         pipelineJob = serviceScope.launch {
             for (utterance in utteranceQueue) {
-                processCapturedUtterance(
-                    utterance.wavBytes,
-                    utterance.durationSec,
-                    utterance.overlapsTts
-                )
+                try {
+                    // One stuck stage (a hung TTS utterance, a stalled HTTP call) must never freeze
+                    // the only consumer: after this budget the chunk is abandoned and listening
+                    // continues.
+                    val finished = withTimeoutOrNull(UTTERANCE_BUDGET_MS) {
+                        processCapturedUtterance(
+                            utterance.wavBytes,
+                            utterance.durationSec,
+                            utterance.overlapsTts
+                        )
+                        true
+                    }
+                    if (finished == null) {
+                        CopilotStateBus.log(
+                            "TIMEOUT",
+                            "One utterance took longer than ${UTTERANCE_BUDGET_MS / 1000}s and was " +
+                                "abandoned so listening could continue.",
+                            isError = true
+                        )
+                        CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
+                    }
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (t: Throwable) {
+                    // Before this guard an unexpected exception killed the consumer coroutine and the
+                    // app went silent for the rest of the session.
+                    CopilotStateBus.log(
+                        "PIPELINE_ERR",
+                        "Utterance failed: ${t.message ?: t.toString()}",
+                        isError = true
+                    )
+                    CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
+                }
             }
         }
     }
