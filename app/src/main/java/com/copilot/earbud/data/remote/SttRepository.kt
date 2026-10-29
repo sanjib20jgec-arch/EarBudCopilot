@@ -21,9 +21,14 @@ import java.util.concurrent.TimeUnit
 class SttRepository {
 
     companion object {
-        private val GROQ_WHISPER_MODELS = listOf(
+        private val GROQ_WHISPER_FAST_MODELS = listOf(
             "whisper-large-v3-turbo",
             "whisper-large-v3"
+        )
+
+        private val GROQ_WHISPER_ACCURATE_MODELS = listOf(
+            "whisper-large-v3",
+            "whisper-large-v3-turbo"
         )
     }
 
@@ -40,10 +45,21 @@ class SttRepository {
         wavBytes: ByteArray,
         provider: SttProvider,
         groqApiKey: String,
-        deepgramApiKey: String
+        deepgramApiKey: String,
+        languageCode: String = "",
+        accurateWhisper: Boolean = false
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
-            Result.success(transcribeWithFallback(wavBytes, provider, groqApiKey, deepgramApiKey))
+            Result.success(
+                transcribeWithFallback(
+                    wavBytes = wavBytes,
+                    provider = provider,
+                    groqApiKey = groqApiKey,
+                    deepgramApiKey = deepgramApiKey,
+                    languageCode = languageCode,
+                    accurateWhisper = accurateWhisper
+                )
+            )
         } catch (cancellation: CancellationException) {
             throw cancellation
         } catch (t: Throwable) {
@@ -60,7 +76,9 @@ class SttRepository {
         wavBytes: ByteArray,
         provider: SttProvider,
         groqApiKey: String,
-        deepgramApiKey: String
+        deepgramApiKey: String,
+        languageCode: String,
+        accurateWhisper: Boolean
     ): String {
         val order = LinkedHashSet<SttProvider>()
         order.add(provider)
@@ -78,8 +96,10 @@ class SttRepository {
             }
             val transcript = try {
                 when (candidate) {
-                    SttProvider.GROQ_WHISPER -> transcribeWithGroqWhisper(wavBytes, key)
-                    SttProvider.DEEPGRAM_NOVA2 -> transcribeWithDeepgram(wavBytes, key)
+                    SttProvider.GROQ_WHISPER ->
+                        transcribeWithGroqWhisper(wavBytes, key, languageCode, accurateWhisper)
+                    SttProvider.DEEPGRAM_NOVA2 ->
+                        transcribeWithDeepgram(wavBytes, key, languageCode)
                 }
             } catch (cancellation: CancellationException) {
                 throw cancellation
@@ -107,12 +127,18 @@ class SttRepository {
         }
     }
 
-    private fun transcribeWithGroqWhisper(wavBytes: ByteArray, apiKey: String): String {
+    private fun transcribeWithGroqWhisper(
+        wavBytes: ByteArray,
+        apiKey: String,
+        languageCode: String,
+        accurateWhisper: Boolean
+    ): String {
         require(apiKey.isNotBlank()) { "Groq API key is missing. Tap the top-right settings icon and enter it." }
 
+        val modelList = if (accurateWhisper) GROQ_WHISPER_ACCURATE_MODELS else GROQ_WHISPER_FAST_MODELS
         val candidates = LinkedHashSet<String>()
-        resolvedWhisperModel?.let { candidates.add(it) }
-        candidates.addAll(GROQ_WHISPER_MODELS)
+        resolvedWhisperModel?.let { if (it in modelList) candidates.add(it) }
+        candidates.addAll(modelList)
 
         var lastError = ""
         for (modelId in candidates) {
@@ -127,6 +153,11 @@ class SttRepository {
                 )
                 .addFormDataPart("temperature", "0.0")
                 .addFormDataPart("response_format", "json")
+                .apply {
+                    // A wrong auto-detected language is a common cause of garbled Banglish; an
+                    // explicit hint makes the transcript markedly more consistent.
+                    if (languageCode.isNotBlank()) addFormDataPart("language", languageCode)
+                }
                 .build()
 
             val request = Request.Builder()
@@ -148,12 +179,14 @@ class SttRepository {
         throw IllegalStateException(lastError)
     }
 
-    private fun transcribeWithDeepgram(wavBytes: ByteArray, apiKey: String): String {
+    private fun transcribeWithDeepgram(wavBytes: ByteArray, apiKey: String, languageCode: String): String {
         require(apiKey.isNotBlank()) { "Deepgram API key is missing. Tap the top-right settings icon and enter it." }
 
+        // detect_language was dropped: it costs latency and fights the explicit hint.
+        val languageParam = if (languageCode.isNotBlank()) "&language=$languageCode" else ""
         val requestBody = wavBytes.toRequestBody("audio/wav".toMediaType())
         val request = Request.Builder()
-            .url("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&detect_language=true")
+            .url("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true$languageParam")
             .addHeader("Authorization", "Token $apiKey")
             .post(requestBody)
             .build()

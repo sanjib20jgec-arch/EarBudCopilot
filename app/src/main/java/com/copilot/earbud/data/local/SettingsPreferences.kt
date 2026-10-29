@@ -6,7 +6,9 @@ import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.copilot.earbud.domain.model.LlmProvider
+import com.copilot.earbud.domain.model.SttLanguage
 import com.copilot.earbud.domain.model.SttProvider
+import com.copilot.earbud.domain.model.WhisperMode
 
 /**
  * Persistent settings.
@@ -110,6 +112,28 @@ class SettingsPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_REQUIRE_EARPHONES, true)
         set(value) = prefs.edit().putBoolean(KEY_REQUIRE_EARPHONES, value).apply()
 
+    /**
+     * Keep capturing audio while the answer is being spoken, so surrounding conversation during the
+     * reply is not lost. Self-echo is filtered downstream instead of cutting the microphone.
+     */
+    var keepListeningDuringTts: Boolean
+        get() = prefs.getBoolean(KEY_KEEP_LISTENING_DURING_TTS, true)
+        set(value) = prefs.edit().putBoolean(KEY_KEEP_LISTENING_DURING_TTS, value).apply()
+
+    var sttLanguage: SttLanguage
+        get() {
+            val name = prefs.getString(KEY_STT_LANGUAGE, SttLanguage.AUTO.name)
+            return runCatching { SttLanguage.valueOf(name!!) }.getOrDefault(SttLanguage.AUTO)
+        }
+        set(value) = prefs.edit().putString(KEY_STT_LANGUAGE, value.name).apply()
+
+    var whisperMode: WhisperMode
+        get() {
+            val name = prefs.getString(KEY_WHISPER_MODE, WhisperMode.FAST.name)
+            return runCatching { WhisperMode.valueOf(name!!) }.getOrDefault(WhisperMode.FAST)
+        }
+        set(value) = prefs.edit().putString(KEY_WHISPER_MODE, value.name).apply()
+
     /** True while the user expects the copilot to be listening; used to offer a resume after reboot. */
     var resumeAfterBoot: Boolean
         get() = prefs.getBoolean(KEY_RESUME_AFTER_BOOT, false)
@@ -147,5 +171,8 @@ class SettingsPreferences(context: Context) {
         private const val KEY_VAD_THRESHOLD = "vad_threshold_rms"
         private const val KEY_REQUIRE_EARPHONES = "require_earphones_tts"
         private const val KEY_RESUME_AFTER_BOOT = "resume_after_boot"
+        private const val KEY_KEEP_LISTENING_DURING_TTS = "keep_listening_during_tts"
+        private const val KEY_STT_LANGUAGE = "stt_language"
+        private const val KEY_WHISPER_MODE = "whisper_mode"
     }
 }

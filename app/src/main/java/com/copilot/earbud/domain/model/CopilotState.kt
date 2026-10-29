@@ -5,6 +5,19 @@ enum class SttProvider(val displayName: String) {
     DEEPGRAM_NOVA2("Deepgram Nova-2 (Multilingual)")
 }
 
+/** Optional language hint for speech-to-text. Auto lets the provider detect Banglish itself. */
+enum class SttLanguage(val apiCode: String, val displayName: String, val chipLabel: String) {
+    AUTO("", "Auto detect", "Auto"),
+    BENGALI("bn", "Bengali (bn)", "Bengali"),
+    ENGLISH("en", "English (en)", "English")
+}
+
+/** Whisper model preference: turbo is ~2x faster, large-v3 is slightly more accurate. */
+enum class WhisperMode(val displayName: String, val chipLabel: String) {
+    FAST("Fast (large-v3-turbo)", "Fast"),
+    ACCURATE("Accurate (large-v3)", "Accurate")
+}
+
 enum class LlmProvider(val displayName: String) {
     GEMINI_FLASH("Google Gemini 2.0 Flash"),
     GROQ_LLAMA("Groq Llama 3.3 70B")
@@ -87,6 +100,11 @@ data class CopilotUiState(
     val geminiKeySet: Boolean = false,
     val vadThresholdRms: Float = 420f,
     val requireEarphonesForTts: Boolean = true,
+
+    /** Keep the microphone open while the answer is being spoken. */
+    val keepListeningDuringTts: Boolean = true,
+    val sttLanguage: SttLanguage = SttLanguage.AUTO,
+    val whisperMode: WhisperMode = WhisperMode.FAST,
     val isBatteryOptimizationIgnored: Boolean = false,
     val logs: List<LogEntry> = emptyList()
 )

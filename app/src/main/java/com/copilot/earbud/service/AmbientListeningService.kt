@@ -17,10 +17,12 @@ import com.copilot.earbud.audio.AudioCaptureManager
 import com.copilot.earbud.audio.EarbudTtsManager
 import com.copilot.earbud.data.local.SettingsPreferences
 import com.copilot.earbud.data.remote.AiBrainRepository
+import com.copilot.earbud.data.remote.SelfEchoDetector
 import com.copilot.earbud.data.remote.SttRepository
 import com.copilot.earbud.domain.model.BrainDecision
 import com.copilot.earbud.domain.model.PipelineStage
 import com.copilot.earbud.domain.model.TtsOutcome
+import com.copilot.earbud.domain.model.WhisperMode
 import com.copilot.earbud.ui.MainActivity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -44,6 +46,7 @@ class AmbientListeningService : Service() {
         const val ACTION_STOP = "com.copilot.earbud.action.STOP"
         const val ACTION_UPDATE_CONFIG = "com.copilot.earbud.action.UPDATE_CONFIG"
         private const val NOTIFICATION_ID = 1001
+        private const val SELF_ECHO_WINDOW_MS = 20000L
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -59,12 +62,22 @@ class AmbientListeningService : Service() {
     /**
      * Captured utterances are processed by exactly ONE consumer coroutine. Previously every chunk
      * launched its own coroutine, so two utterances could interleave, fight over the single
-     * `isPausedForTts` flag and flush each other's speech.
+     * `ttsSpeaking` flag and flush each other's speech.
      */
     private var utteranceQueue = Channel<CapturedUtterance>(capacity = 4)
     private var pipelineJob: Job? = null
 
-    private data class CapturedUtterance(val wavBytes: ByteArray, val durationSec: Float)
+    @Volatile
+    private var lastSpokenAnswer: String? = null
+
+    @Volatile
+    private var lastSpokenAtMs: Long = 0L
+
+    private data class CapturedUtterance(
+        val wavBytes: ByteArray,
+        val durationSec: Float,
+        val overlapsTts: Boolean
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -83,6 +96,7 @@ class AmbientListeningService : Service() {
             }
             ACTION_UPDATE_CONFIG -> {
                 audioCaptureManager?.setVadThreshold(prefs.vadThresholdRms)
+                audioCaptureManager?.keepListeningDuringTts = prefs.keepListeningDuringTts
                 earbudTtsManager?.refreshEarphoneStatus()
                 return START_STICKY
             }
@@ -157,8 +171,8 @@ class AmbientListeningService : Service() {
                     CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
                 }
             },
-            onUtteranceCaptured = { wavBytes, durationSec ->
-                val queued = utteranceQueue.trySend(CapturedUtterance(wavBytes, durationSec))
+            onUtteranceCaptured = { wavBytes, durationSec, overlapsTts ->
+                val queued = utteranceQueue.trySend(CapturedUtterance(wavBytes, durationSec, overlapsTts))
                 if (queued.isFailure) {
                     CopilotStateBus.log("VAD", "Pipeline busy - speech chunk dropped (queue full).", isError = true)
                 }
@@ -168,6 +182,7 @@ class AmbientListeningService : Service() {
                 CopilotStateBus.log("AUDIO_ERR", errMsg, isError = true)
             }
         )
+        capture.keepListeningDuringTts = prefs.keepListeningDuringTts
         audioCaptureManager = capture
         capture.startCapture()
     }
@@ -176,12 +191,21 @@ class AmbientListeningService : Service() {
         if (pipelineJob?.isActive == true) return
         pipelineJob = serviceScope.launch {
             for (utterance in utteranceQueue) {
-                processCapturedUtterance(utterance.wavBytes, utterance.durationSec)
+                processCapturedUtterance(
+                    utterance.wavBytes,
+                    utterance.durationSec,
+                    utterance.overlapsTts
+                )
             }
         }
     }
 
-    private suspend fun processCapturedUtterance(wavBytes: ByteArray, durationSec: Float) {
+    private suspend fun processCapturedUtterance(
+        wavBytes: ByteArray,
+        durationSec: Float,
+        overlapsTts: Boolean
+    ) {
+        val startedAtMs = System.currentTimeMillis()
         CopilotStateBus.setPipelineStage(PipelineStage.TRANSCRIBING_STT)
         val sttProvider = prefs.sttProvider
         CopilotStateBus.log(
@@ -189,12 +213,16 @@ class AmbientListeningService : Service() {
             String.format("Speech chunk finalized (%.1fs, %d KB) -> %s", durationSec, wavBytes.size / 1024, sttProvider.name)
         )
 
+        val sttStartedAtMs = System.currentTimeMillis()
         val sttResult = sttRepository.transcribeWav(
             wavBytes = wavBytes,
             provider = sttProvider,
             groqApiKey = prefs.groqApiKey,
-            deepgramApiKey = prefs.deepgramApiKey
+            deepgramApiKey = prefs.deepgramApiKey,
+            languageCode = prefs.sttLanguage.apiCode,
+            accurateWhisper = prefs.whisperMode == WhisperMode.ACCURATE
         )
+        val sttMs = System.currentTimeMillis() - sttStartedAtMs
 
         val transcript = sttResult.getOrElse { err ->
             CopilotStateBus.log("STT_ERR", err.message ?: "STT failed", isError = true)
@@ -208,9 +236,21 @@ class AmbientListeningService : Service() {
             return
         }
 
+        // The mic stays open while we speak, so filter out our own voice leaking back in.
+        if (overlapsTts && isLikelySelfEcho(transcript)) {
+            CopilotStateBus.log(
+                "ECHO",
+                "Ignored: the microphone picked up our own spoken answer (self-echo). " +
+                    "Surrounding voices are still being captured."
+            )
+            CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
+            return
+        }
+
         CopilotStateBus.log("STT", "Heard: \"$transcript\"")
         CopilotStateBus.setPipelineStage(PipelineStage.ANALYZING_INTENT)
 
+        val llmStartedAtMs = System.currentTimeMillis()
         val decision = aiBrainRepository.analyzeTranscript(
             transcript = transcript,
             provider = prefs.llmProvider,
@@ -219,6 +259,7 @@ class AmbientListeningService : Service() {
         ).getOrElse { err ->
             BrainDecision.Failed(err.message ?: "AI brain request failed")
         }
+        val llmMs = System.currentTimeMillis() - llmStartedAtMs
 
         val answer = when (decision) {
             // A real failure (auth, quota, transport, empty/truncated/blocked response). This is
@@ -243,7 +284,10 @@ class AmbientListeningService : Service() {
         updateNotification("Answer ready: ${answer.text}")
 
         CopilotStateBus.setPipelineStage(PipelineStage.WHISPERING_TTS)
-        audioCaptureManager?.isPausedForTts = true
+        lastSpokenAnswer = answer.text
+        lastSpokenAtMs = System.currentTimeMillis()
+        audioCaptureManager?.ttsSpeaking = true
+        val ttsStartedAtMs = System.currentTimeMillis()
         val outcome = try {
             earbudTtsManager?.whisperToEarbuds(
                 text = answer.text,
@@ -255,8 +299,15 @@ class AmbientListeningService : Service() {
             CopilotStateBus.log("TTS_ERR", "Whisper failed: ${t.message}", isError = true)
             TtsOutcome.ENGINE_ERROR
         } finally {
-            audioCaptureManager?.isPausedForTts = false
+            audioCaptureManager?.ttsSpeaking = false
         }
+        val ttsMs = System.currentTimeMillis() - ttsStartedAtMs
+
+        CopilotStateBus.log(
+            "PERF",
+            "STT ${sttMs}ms | AI ${llmMs}ms | speak ${ttsMs}ms | " +
+                "end-to-end ${System.currentTimeMillis() - startedAtMs}ms"
+        )
 
         // Report what actually happened instead of silently resetting the stage.
         when (outcome) {
@@ -286,6 +337,16 @@ class AmbientListeningService : Service() {
                 CopilotStateBus.setPipelineStage(PipelineStage.TTS_FAILED)
             }
         }
+    }
+
+    /**
+     * True when the microphone most likely picked up the answer we just spoke: the transcript is
+     * largely made of the words of that answer and it arrived inside [SELF_ECHO_WINDOW_MS].
+     */
+    private fun isLikelySelfEcho(transcript: String): Boolean {
+        val spoken = lastSpokenAnswer ?: return false
+        if (System.currentTimeMillis() - lastSpokenAtMs > SELF_ECHO_WINDOW_MS) return false
+        return SelfEchoDetector.isLikelyEcho(transcript, spoken)
     }
 
     private fun acquireWakeLock() {

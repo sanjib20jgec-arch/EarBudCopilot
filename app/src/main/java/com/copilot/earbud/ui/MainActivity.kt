@@ -43,7 +43,9 @@ import com.copilot.earbud.domain.model.CopilotUiState
 import com.copilot.earbud.domain.model.LlmProvider
 import com.copilot.earbud.domain.model.LogEntry
 import com.copilot.earbud.domain.model.PipelineStage
+import com.copilot.earbud.domain.model.SttLanguage
 import com.copilot.earbud.domain.model.SttProvider
+import com.copilot.earbud.domain.model.WhisperMode
 import com.copilot.earbud.service.CopilotStateBus
 
 class MainActivity : ComponentActivity() {
@@ -74,6 +76,9 @@ class MainActivity : ComponentActivity() {
                     onGeminiKeyChange = viewModel::updateGeminiApiKey,
                     onVadThresholdChange = viewModel::updateVadThreshold,
                     onRequireEarphonesChange = viewModel::setRequireEarphones,
+                    onKeepListeningChange = viewModel::setKeepListeningDuringTts,
+                    onSttLanguageChange = viewModel::selectSttLanguage,
+                    onWhisperModeChange = viewModel::selectWhisperMode,
                     onRequestBatteryExemption = { requestBatteryOptimizationExemption() },
                     onSimulateTranscript = viewModel::simulateBanglishTranscript,
                     onRunDiagnostics = viewModel::runDiagnostics,
@@ -111,6 +116,9 @@ fun CopilotControlScreen(
     onGeminiKeyChange: (String) -> Unit,
     onVadThresholdChange: (Float) -> Unit,
     onRequireEarphonesChange: (Boolean) -> Unit,
+    onKeepListeningChange: (Boolean) -> Unit,
+    onSttLanguageChange: (SttLanguage) -> Unit,
+    onWhisperModeChange: (WhisperMode) -> Unit,
     onRequestBatteryExemption: () -> Unit,
     onSimulateTranscript: (String) -> Unit,
     onRunDiagnostics: () -> Unit,
@@ -360,6 +368,51 @@ fun CopilotControlScreen(
                                 checked = state.requireEarphonesForTts,
                                 onCheckedChange = onRequireEarphonesChange
                             )
+                        }
+
+                        // Continuous listening: mic stays open even while the answer is spoken
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Keep Listening While Speaking", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                Text(
+                                    "Mic stays open during the answer so surrounding talk is not missed " +
+                                        "(our own voice is filtered out)",
+                                    fontSize = 11.sp,
+                                    color = Color(0xFF94A3B8)
+                                )
+                            }
+                            Switch(
+                                checked = state.keepListeningDuringTts,
+                                onCheckedChange = onKeepListeningChange
+                            )
+                        }
+
+                        // Transcription language hint (biggest single lever on Banglish accuracy)
+                        Text("Transcription Language:", fontSize = 12.sp, color = Color(0xFF94A3B8))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SttLanguage.entries.forEach { language ->
+                                FilterChip(
+                                    selected = state.sttLanguage == language,
+                                    onClick = { onSttLanguageChange(language) },
+                                    label = { Text(language.chipLabel, fontSize = 11.sp) }
+                                )
+                            }
+                        }
+
+                        // Whisper model trade-off: speed vs accuracy
+                        Text("Whisper Model:", fontSize = 12.sp, color = Color(0xFF94A3B8))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            WhisperMode.entries.forEach { mode ->
+                                FilterChip(
+                                    selected = state.whisperMode == mode,
+                                    onClick = { onWhisperModeChange(mode) },
+                                    label = { Text(mode.chipLabel, fontSize = 11.sp) }
+                                )
+                            }
                         }
 
                         if (!state.isBatteryOptimizationIgnored) {

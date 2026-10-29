@@ -34,9 +34,11 @@ internal object BrainResponseParser {
     /**
      * Head-room for one short sentence *plus* any hidden reasoning tokens. Gemini 2.5/3 Flash count
      * thinking tokens against `maxOutputTokens`; a tight budget made them return an empty candidate
-     * (finishReason=MAX_TOKENS) which used to be misread as "[IGNORE]".
+     * (finishReason=MAX_TOKENS) which used to be misread as "[IGNORE]". Thinking is normally
+     * disabled now, so 512 still leaves ~30x the room a one-sentence answer needs while halving the
+     * worst-case generation time compared to 1024.
      */
-    const val GEMINI_MAX_OUTPUT_TOKENS = 1024
+    const val GEMINI_MAX_OUTPUT_TOKENS = 512
 
     /** Same idea for Groq: enough for a one-line answer plus the reasoning of reasoning models. */
     const val GROQ_MAX_TOKENS = 512
