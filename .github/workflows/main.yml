@@ -52,21 +52,42 @@ jobs:
           PROJECT_DIR=$(dirname "$BUILD_FILE")
           cd "$PROJECT_DIR"
 
+          # Surface the real compiler/test errors as GitHub annotations: the job log is not always
+          # reachable from tooling, annotations are.
+          report_failure() {
+            local logfile="$1"
+            local label="$2"
+            echo "::error::$label failed - see the annotated lines below"
+            grep -aE '^e: |error:|FAILED|Execution failed|Caused by:|> Task .* FAILED|tests completed' "$logfile" \
+              | head -25 | while IFS= read -r line; do echo "::error::$line"; done
+            tail -n 25 "$logfile" | while IFS= read -r line; do echo "::error::$line"; done
+          }
+
           if [ -d app/src/test ]; then
             echo "Running JVM unit tests"
-            gradle testDebugUnitTest --no-daemon --stacktrace
+            if ! gradle testDebugUnitTest --no-daemon --stacktrace > unit-tests.log 2>&1; then
+              report_failure unit-tests.log "Unit tests"
+              exit 1
+            fi
+            tail -n 5 unit-tests.log
           fi
 
           if [ -n "$RELEASE_KEYSTORE_FILE" ] && [ -n "$RELEASE_STORE_PASSWORD" ] \
              && [ -n "$RELEASE_KEY_ALIAS" ] && [ -n "$RELEASE_KEY_PASSWORD" ]; then
             echo "Building signed release APK (stable signature)"
-            gradle assembleRelease --no-daemon --stacktrace
+            TASK=assembleRelease
             APK_PATH="app/build/outputs/apk/release/app-release.apk"
           else
             echo "Building debug APK"
-            gradle assembleDebug --no-daemon --stacktrace
+            TASK=assembleDebug
             APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
           fi
+
+          if ! gradle "$TASK" --no-daemon --stacktrace > build.log 2>&1; then
+            report_failure build.log "Gradle $TASK"
+            exit 1
+          fi
+          tail -n 5 build.log
 
           mkdir -p "$GITHUB_WORKSPACE/apk_out"
           cp "$APK_PATH" "$GITHUB_WORKSPACE/apk_out/EarbudAmbientCopilot.apk"
