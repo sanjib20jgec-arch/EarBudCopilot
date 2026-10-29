@@ -8,25 +8,50 @@ jobs:
   build-apk:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK Licenses
+        run: yes | sdkmanager --licenses || true
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+      - name: Locate Project or Unzip and Build APK
+        run: |
+          echo "Checking repository files..."
+          ls -la
+          # যদি ইউজার সরাসরি .zip ফাইল আপলোড করে থাকে, তাহলে নিজে থেকেই আনজিপ করবে
+          if ls *.zip 1> /dev/null 2>&1; then
+            echo "Found zip file! Extracting..."
+            unzip -o "*.zip"
+          fi
+          # build.gradle.kts ফাইলটি যে ফোল্ডারেই থাকুক খুঁজে বের করবে
+          BUILD_FILE=$(find . -maxdepth 3 -name "settings.gradle.kts" | head -n 1)
+          if [ -z "$BUILD_FILE" ]; then
+            echo "ERROR: প্রজেক্টের ফাইলগুলো এখনও GitHub-এ আপলোড করা হয়নি! অনুগ্রহ করে EarbudAmbientCopilot_GitHub_APK_Ready.zip ফাইলটি GitHub-এ Upload করো।"
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$BUILD_FILE")
+          echo "Found Android project in: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+          gradle assembleDebug --no-daemon --stacktrace
+          mkdir -p "$GITHUB_WORKSPACE/apk_out"
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/apk_out/EarbudAmbientCopilot.apk"
 
       - name: Upload Ready-to-Install APK
         uses: actions/upload-artifact@v4
         with:
           name: Earbud-Ambient-Copilot-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: apk_out/EarbudAmbientCopilot.apk
