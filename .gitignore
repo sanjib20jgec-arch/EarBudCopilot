@@ -1,0 +1,26 @@
+# Gradle / Android build output
+.gradle/
+build/
+app/build/
+captures/
+.cxx/
+local.properties
+*.iml
+.idea/
+
+# Signing material and secrets - NEVER commit these
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.env
+.env
+
+# Packaged artefacts
+*.apk
+*.aab
+*.zip
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

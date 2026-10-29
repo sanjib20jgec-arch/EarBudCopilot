@@ -18,12 +18,17 @@ import com.copilot.earbud.audio.EarbudTtsManager
 import com.copilot.earbud.data.local.SettingsPreferences
 import com.copilot.earbud.data.remote.AiBrainRepository
 import com.copilot.earbud.data.remote.SttRepository
+import com.copilot.earbud.domain.model.BrainDecision
 import com.copilot.earbud.domain.model.PipelineStage
+import com.copilot.earbud.domain.model.TtsOutcome
 import com.copilot.earbud.ui.MainActivity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
 /**
@@ -51,25 +56,28 @@ class AmbientListeningService : Service() {
     private var audioCaptureManager: AudioCaptureManager? = null
     private var earbudTtsManager: EarbudTtsManager? = null
 
+    /**
+     * Captured utterances are processed by exactly ONE consumer coroutine. Previously every chunk
+     * launched its own coroutine, so two utterances could interleave, fight over the single
+     * `isPausedForTts` flag and flush each other's speech.
+     */
+    private var utteranceQueue = Channel<CapturedUtterance>(capacity = 4)
+    private var pipelineJob: Job? = null
+
+    private data class CapturedUtterance(val wavBytes: ByteArray, val durationSec: Float)
+
     override fun onCreate() {
         super.onCreate()
         prefs = SettingsPreferences(this)
 
-        earbudTtsManager = EarbudTtsManager(
-            context = this,
-            onEarphoneConnectionChanged = { state ->
-                CopilotStateBus.updateEarphoneState(state)
-            },
-            onLog = { msg ->
-                CopilotStateBus.log("TTS", msg)
-            }
-        )
+        // Process-wide singleton: the UI's "Quick Test" button shares this exact engine.
+        earbudTtsManager = EarbudTtsManager.get(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopAmbientCopilot()
+                stopAmbientCopilot(clearResumeFlag = true)
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -79,6 +87,15 @@ class AmbientListeningService : Service() {
                 return START_STICKY
             }
             else -> {
+                // Pre-flight: refuse to start a microphone pipeline that cannot possibly answer.
+                // Stopping before startForeground() is safe and avoids a foreground-service timeout.
+                val configIssue = prefs.configIssue()
+                if (configIssue != null) {
+                    CopilotStateBus.log("CONFIG", "Service not started: $configIssue", isError = true)
+                    CopilotStateBus.setPipelineStage(PipelineStage.IDLE)
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 startAmbientCopilot()
                 return START_STICKY
             }
@@ -90,15 +107,30 @@ class AmbientListeningService : Service() {
 
         // 1. Promote to Foreground Service with FOREGROUND_SERVICE_TYPE_MICROPHONE (Android 14 / SDK 34+)
         val notification = buildNotification("Listening passively for Banglish questions...")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (t: Throwable) {
+            // On Android 12+ starting a microphone foreground service while the app is in the
+            // background throws. Fail loudly instead of crashing the whole process.
+            CopilotStateBus.log(
+                "SERVICE",
+                "Could not start the microphone foreground service: ${t.message}. " +
+                    "Open the app and press START again, and allow it to ignore battery optimization.",
+                isError = true
             )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+            CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
+            stopSelf()
+            return
         }
+        prefs.resumeAfterBoot = true
 
         // 2. Acquire PARTIAL_WAKE_LOCK so CPU stays awake when screen is locked/off
         acquireWakeLock()
@@ -107,7 +139,10 @@ class AmbientListeningService : Service() {
         CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
         CopilotStateBus.log("SERVICE", "Ambient Listening Foreground Service started (WakeLock active).")
 
-        // 3. Start AudioRecord + VAD pipeline
+        // 3. Start AudioRecord + VAD pipeline, drained by a single sequential consumer
+        utteranceQueue = Channel(capacity = 4)
+        startPipelineConsumer()
+
         val capture = AudioCaptureManager(
             context = this,
             scope = serviceScope,
@@ -123,7 +158,10 @@ class AmbientListeningService : Service() {
                 }
             },
             onUtteranceCaptured = { wavBytes, durationSec ->
-                processCapturedUtterance(wavBytes, durationSec)
+                val queued = utteranceQueue.trySend(CapturedUtterance(wavBytes, durationSec))
+                if (queued.isFailure) {
+                    CopilotStateBus.log("VAD", "Pipeline busy - speech chunk dropped (queue full).", isError = true)
+                }
             },
             onError = { errMsg ->
                 CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
@@ -134,69 +172,118 @@ class AmbientListeningService : Service() {
         capture.startCapture()
     }
 
-    private fun processCapturedUtterance(wavBytes: ByteArray, durationSec: Float) {
-        serviceScope.launch {
-            CopilotStateBus.setPipelineStage(PipelineStage.TRANSCRIBING_STT)
-            val sttProvider = prefs.sttProvider
-            CopilotStateBus.log(
-                "VAD",
-                String.format("Speech chunk finalized (%.1fs, %d KB) -> %s", durationSec, wavBytes.size / 1024, sttProvider.name)
-            )
-
-            val sttResult = sttRepository.transcribeWav(
-                wavBytes = wavBytes,
-                provider = sttProvider,
-                groqApiKey = prefs.groqApiKey,
-                deepgramApiKey = prefs.deepgramApiKey
-            )
-
-            val transcript = sttResult.getOrElse { err ->
-                CopilotStateBus.log("STT_ERR", err.message ?: "STT failed", isError = true)
-                CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
-                return@launch
+    private fun startPipelineConsumer() {
+        if (pipelineJob?.isActive == true) return
+        pipelineJob = serviceScope.launch {
+            for (utterance in utteranceQueue) {
+                processCapturedUtterance(utterance.wavBytes, utterance.durationSec)
             }
+        }
+    }
 
-            if (transcript.length < 3) {
-                CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
-                return@launch
+    private suspend fun processCapturedUtterance(wavBytes: ByteArray, durationSec: Float) {
+        CopilotStateBus.setPipelineStage(PipelineStage.TRANSCRIBING_STT)
+        val sttProvider = prefs.sttProvider
+        CopilotStateBus.log(
+            "VAD",
+            String.format("Speech chunk finalized (%.1fs, %d KB) -> %s", durationSec, wavBytes.size / 1024, sttProvider.name)
+        )
+
+        val sttResult = sttRepository.transcribeWav(
+            wavBytes = wavBytes,
+            provider = sttProvider,
+            groqApiKey = prefs.groqApiKey,
+            deepgramApiKey = prefs.deepgramApiKey
+        )
+
+        val transcript = sttResult.getOrElse { err ->
+            CopilotStateBus.log("STT_ERR", err.message ?: "STT failed", isError = true)
+            CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
+            return
+        }
+
+        if (transcript.length < 3) {
+            CopilotStateBus.log("STT", "Ignored: transcript too short (${transcript.length} chars).")
+            CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
+            return
+        }
+
+        CopilotStateBus.log("STT", "Heard: \"$transcript\"")
+        CopilotStateBus.setPipelineStage(PipelineStage.ANALYZING_INTENT)
+
+        val decision = aiBrainRepository.analyzeTranscript(
+            transcript = transcript,
+            provider = prefs.llmProvider,
+            geminiApiKey = prefs.geminiApiKey,
+            groqApiKey = prefs.groqApiKey
+        ).getOrElse { err ->
+            BrainDecision.Failed(err.message ?: "AI brain request failed")
+        }
+
+        val answer = when (decision) {
+            // A real failure (auth, quota, transport, empty/truncated/blocked response). This is
+            // NOT the same thing as "the model decided this was not a question" and is never
+            // reported as an [IGNORE].
+            is BrainDecision.Failed -> {
+                CopilotStateBus.log("LLM_ERR", decision.message, isError = true)
+                CopilotStateBus.setPipelineStage(PipelineStage.ERROR)
+                return
             }
-
-            CopilotStateBus.log("STT", "Heard: \"$transcript\"")
-            CopilotStateBus.setPipelineStage(PipelineStage.ANALYZING_INTENT)
-
-            val llmResult = aiBrainRepository.analyzeTranscript(
-                transcript = transcript,
-                provider = prefs.llmProvider,
-                geminiApiKey = prefs.geminiApiKey,
-                groqApiKey = prefs.groqApiKey
-            )
-
-            val answer = llmResult.getOrElse { err ->
-                CopilotStateBus.log("LLM_ERR", err.message ?: "LLM analysis failed", isError = true)
-                CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
-                return@launch
+            // The model deliberately classified this as conversational/social.
+            is BrainDecision.Ignored -> {
+                CopilotStateBus.log("FILTER", decision.reason)
+                CopilotStateBus.setPipelineStage(PipelineStage.FILTERED)
+                return
             }
+            is BrainDecision.Answer -> decision
+        }
 
-            if (answer == null) {
-                CopilotStateBus.log("BRAIN", "[IGNORE] (Conversational / non-factual remark)")
+        // Objective question detected! Whisper crisp 1-sentence answer into earphones
+        CopilotStateBus.log("ANSWER", answer.text, isHighlight = true)
+        updateNotification("Answer ready: ${answer.text}")
+
+        CopilotStateBus.setPipelineStage(PipelineStage.WHISPERING_TTS)
+        audioCaptureManager?.isPausedForTts = true
+        val outcome = try {
+            earbudTtsManager?.whisperToEarbuds(
+                text = answer.text,
+                requireEarphones = prefs.requireEarphonesForTts
+            ) ?: TtsOutcome.NOT_READY
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (t: Throwable) {
+            CopilotStateBus.log("TTS_ERR", "Whisper failed: ${t.message}", isError = true)
+            TtsOutcome.ENGINE_ERROR
+        } finally {
+            audioCaptureManager?.isPausedForTts = false
+        }
+
+        // Report what actually happened instead of silently resetting the stage.
+        when (outcome) {
+            TtsOutcome.SPOKEN -> {
+                CopilotStateBus.log("TTS", "Answer spoken into the earbuds.")
                 CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
-                return@launch
             }
-
-            // Objective question detected! Whisper crisp 1-sentence answer into earphones
-            CopilotStateBus.log("ANSWER", answer, isHighlight = true)
-            updateNotification("Whispered: $answer")
-
-            CopilotStateBus.setPipelineStage(PipelineStage.WHISPERING_TTS)
-            audioCaptureManager?.isPausedForTts = true
-            try {
-                earbudTtsManager?.whisperToEarbuds(
-                    text = answer,
-                    requireEarphones = prefs.requireEarphonesForTts
+            TtsOutcome.NO_EARPHONES -> {
+                CopilotStateBus.log(
+                    "TTS",
+                    "Answer NOT spoken: no wired/Bluetooth earphones detected while " +
+                        "\"Strict Earbud-Only Whisper\" is ON.",
+                    isError = true
                 )
-            } finally {
-                audioCaptureManager?.isPausedForTts = false
-                CopilotStateBus.setPipelineStage(PipelineStage.LISTENING_AMBIENT)
+                CopilotStateBus.setPipelineStage(PipelineStage.TTS_BLOCKED)
+            }
+            TtsOutcome.NOT_READY -> {
+                CopilotStateBus.log(
+                    "TTS",
+                    "Answer NOT spoken: the TTS engine is not ready. Check Android Settings > " +
+                        "Text-to-speech output and install the Bengali/English voice data.",
+                    isError = true
+                )
+                CopilotStateBus.setPipelineStage(PipelineStage.TTS_FAILED)
+            }
+            TtsOutcome.ENGINE_ERROR -> {
+                CopilotStateBus.setPipelineStage(PipelineStage.TTS_FAILED)
             }
         }
     }
@@ -259,17 +346,26 @@ class AmbientListeningService : Service() {
         manager.notify(NOTIFICATION_ID, buildNotification(contentText))
     }
 
-    private fun stopAmbientCopilot() {
+    private fun stopAmbientCopilot(clearResumeFlag: Boolean = false) {
         audioCaptureManager?.stopCapture()
         audioCaptureManager = null
+
+        runCatching { utteranceQueue.close() }
+        pipelineJob?.cancel()
+        pipelineJob = null
+
         releaseWakeLock()
+        // Only an explicit user stop clears the "resume after reboot" intent; being killed by the
+        // system must not, otherwise the copilot would never offer to resume.
+        if (clearResumeFlag) prefs.resumeAfterBoot = false
         CopilotStateBus.setServiceRunning(false)
         CopilotStateBus.log("SERVICE", "Ambient Listening Service stopped.")
     }
 
     override fun onDestroy() {
         stopAmbientCopilot()
-        earbudTtsManager?.shutdown()
+        // The TTS engine is a process-wide singleton and is intentionally NOT shut down here:
+        // the UI's Quick Test button may still be using it.
         serviceScope.cancel()
         super.onDestroy()
     }

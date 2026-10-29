@@ -76,6 +76,7 @@ class MainActivity : ComponentActivity() {
                     onRequireEarphonesChange = viewModel::setRequireEarphones,
                     onRequestBatteryExemption = { requestBatteryOptimizationExemption() },
                     onSimulateTranscript = viewModel::simulateBanglishTranscript,
+                    onRunDiagnostics = viewModel::runDiagnostics,
                     onClearLogs = viewModel::clearLogs
                 )
             }
@@ -112,11 +113,17 @@ fun CopilotControlScreen(
     onRequireEarphonesChange: (Boolean) -> Unit,
     onRequestBatteryExemption: () -> Unit,
     onSimulateTranscript: (String) -> Unit,
+    onRunDiagnostics: () -> Unit,
     onClearLogs: () -> Unit
 ) {
     val context = LocalContext.current
-    var showKeys by remember { mutableStateOf(false) }
     var showConfigSection by remember { mutableStateOf(true) }
+
+    // Key material is never read back from storage; these buffers only hold what the user is
+    // typing right now, and are cleared once saved.
+    var groqKeyInput by remember { mutableStateOf("") }
+    var geminiKeyInput by remember { mutableStateOf("") }
+    var deepgramKeyInput by remember { mutableStateOf("") }
 
     val requiredPermissions = remember {
         buildList {
@@ -230,9 +237,11 @@ fun CopilotControlScreen(
                                 fontSize = 14.sp,
                                 color = MaterialTheme.colorScheme.primary
                             )
-                            TextButton(onClick = { showKeys = !showKeys }) {
-                                Text(if (showKeys) "Hide Keys" else "Show Keys", fontSize = 12.sp)
-                            }
+                            Text(
+                                text = "keys are stored encrypted",
+                                fontSize = 10.sp,
+                                color = Color(0xFF64748B)
+                            )
                         }
 
                         // STT Provider Selector
@@ -259,32 +268,56 @@ fun CopilotControlScreen(
                             }
                         }
 
-                        // API Key Inputs
+                        // API Key Inputs (write-only: a saved key is never displayed again)
                         OutlinedTextField(
-                            value = state.groqApiKey,
-                            onValueChange = onGroqKeyChange,
-                            label = { Text("Groq API Key (Whisper v3 / Llama 3.3)") },
+                            value = groqKeyInput,
+                            onValueChange = {
+                                groqKeyInput = it
+                                onGroqKeyChange(it)
+                            },
+                            label = {
+                                Text(
+                                    if (state.groqKeySet) "Groq API Key - saved (type to replace)"
+                                    else "Groq API Key (Whisper STT / Llama brain)"
+                                )
+                            },
                             singleLine = true,
-                            visualTransformation = if (showKeys) VisualTransformation.None else PasswordVisualTransformation(),
+                            visualTransformation = PasswordVisualTransformation(),
                             modifier = Modifier.fillMaxWidth()
                         )
 
                         OutlinedTextField(
-                            value = state.geminiApiKey,
-                            onValueChange = onGeminiKeyChange,
-                            label = { Text("Google Gemini API Key (Gemini 2.0 Flash)") },
+                            value = geminiKeyInput,
+                            onValueChange = {
+                                geminiKeyInput = it
+                                onGeminiKeyChange(it)
+                            },
+                            label = {
+                                Text(
+                                    if (state.geminiKeySet) "Gemini API Key - saved (type to replace)"
+                                    else "Google Gemini API Key (AI brain)"
+                                )
+                            },
                             singleLine = true,
-                            visualTransformation = if (showKeys) VisualTransformation.None else PasswordVisualTransformation(),
+                            visualTransformation = PasswordVisualTransformation(),
                             modifier = Modifier.fillMaxWidth()
                         )
 
                         if (state.sttProvider == SttProvider.DEEPGRAM_NOVA2) {
                             OutlinedTextField(
-                                value = state.deepgramApiKey,
-                                onValueChange = onDeepgramKeyChange,
-                                label = { Text("Deepgram API Key (Nova-2)") },
+                                value = deepgramKeyInput,
+                                onValueChange = {
+                                    deepgramKeyInput = it
+                                    onDeepgramKeyChange(it)
+                                },
+                                label = {
+                                    Text(
+                                        if (state.deepgramKeySet) "Deepgram API Key - saved (type to replace)"
+                                        else "Deepgram API Key (Nova-2)"
+                                    )
+                                },
                                 singleLine = true,
-                                visualTransformation = if (showKeys) VisualTransformation.None else PasswordVisualTransformation(),
+                                visualTransformation = PasswordVisualTransformation(),
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
@@ -345,6 +378,24 @@ fun CopilotControlScreen(
 
             // 3. Quick Banglish Test Bar (Test factual vs social filter anytime)
             QuickTestBar(onSimulateTranscript = onSimulateTranscript)
+
+            OutlinedButton(
+                onClick = onRunDiagnostics,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Build, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Run Diagnostics (TTS / earphones / API keys)", fontSize = 12.sp)
+            }
+
+            Text(
+                text = "Privacy: each detected utterance (up to 10 s of ambient audio) is uploaded " +
+                    "to Groq or Deepgram for transcription, and the transcript is sent to Gemini or " +
+                    "Groq to generate the answer. Nothing is written to disk on the phone and API " +
+                    "keys are stored encrypted.",
+                fontSize = 10.sp,
+                color = Color(0xFF64748B)
+            )
 
             // 4. Real-Time Pipeline Status Logs
             LogsPanel(
@@ -441,7 +492,10 @@ private fun StatusHeaderCard(
                     color = when (state.pipelineStage) {
                         PipelineStage.SPEECH_DETECTED -> Color(0xFFFACC15)
                         PipelineStage.WHISPERING_TTS -> Color(0xFF4ADE80)
-                        PipelineStage.ERROR -> Color(0xFFF87171)
+                        PipelineStage.FILTERED -> Color(0xFF94A3B8)
+                        PipelineStage.ERROR,
+                        PipelineStage.TTS_FAILED -> Color(0xFFF87171)
+                        PipelineStage.TTS_BLOCKED -> Color(0xFFF59E0B)
                         else -> Color(0xFF38BDF8)
                     }
                 )
@@ -450,6 +504,25 @@ private fun StatusHeaderCard(
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace,
                     color = Color(0xFF94A3B8)
+                )
+            }
+
+            // One-line explanation for the states where nothing was heard on purpose / on failure.
+            val stageHint = when (state.pipelineStage) {
+                PipelineStage.ERROR -> "Last attempt failed - read the red line in the activity log."
+                PipelineStage.FILTERED -> "The AI decided this was not a factual question."
+                PipelineStage.TTS_BLOCKED -> "Answer ready but not spoken: no earphones detected (strict mode)."
+                PipelineStage.TTS_FAILED -> "Answer ready but the TTS engine could not speak it."
+                else -> null
+            }
+            if (stageHint != null) {
+                Text(
+                    text = stageHint,
+                    fontSize = 11.sp,
+                    color = when (state.pipelineStage) {
+                        PipelineStage.FILTERED -> Color(0xFF94A3B8)
+                        else -> Color(0xFFF87171)
+                    }
                 )
             }
         }

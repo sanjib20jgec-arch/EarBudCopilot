@@ -33,6 +33,8 @@ class AudioCaptureManager(
         private const val SILENCE_TAIL_MS = 800L // 800ms of silence finalizes chunk
         private const val MIN_SPEECH_DURATION_MS = 650L // Ignore tiny clicks/coughs < 650ms
         private const val MAX_SPEECH_DURATION_MS = 10000L // Force-dispatch chunk at 10 seconds
+        private const val SPEECH_VOTE_WINDOW = 3 // 2-of-3 frames must agree before a state change
+        private const val SPEECH_VOTE_MIN = 2
     }
 
     private val vadDetector = SileroVadDetector(context, initialRmsThreshold)
@@ -86,6 +88,7 @@ class AudioCaptureManager(
         captureJob = scope.launch(Dispatchers.IO) {
             val frameBuffer = ShortArray(FRAME_SAMPLES)
             val preRollQueue = ArrayDeque<ShortArray>(PRE_ROLL_FRAMES)
+            val speechVotes = ArrayDeque<Boolean>(SPEECH_VOTE_WINDOW)
             val activeSpeechPcm = ArrayList<Short>(SAMPLE_RATE * 6)
 
             var isCurrentlySpeaking = false
@@ -109,7 +112,13 @@ class AudioCaptureManager(
                     }
 
                     val frameCopy = frameBuffer.copyOf(readCount)
-                    val (isSpeech, rms) = vadDetector.evaluateFrame(frameCopy, readCount)
+                    val (isSpeechFrame, rms) = vadDetector.evaluateFrame(frameCopy, readCount)
+
+                    // Hysteresis: a single noisy/marginal frame can no longer start or break an
+                    // utterance, which previously split questions into pieces or dropped them.
+                    speechVotes.addLast(isSpeechFrame)
+                    while (speechVotes.size > SPEECH_VOTE_WINDOW) speechVotes.removeFirst()
+                    val isSpeech = speechVotes.count { it } >= SPEECH_VOTE_MIN
 
                     if (++uiRmsThrottleCounter % 3 == 0) {
                         onRmsUpdate(rms)
@@ -187,7 +196,18 @@ class AudioCaptureManager(
     fun stopCapture() {
         captureJob?.cancel()
         captureJob = null
+
+        // Release the recorder deterministically instead of waiting for the coroutine to unwind,
+        // so the microphone is not left open after the service stops.
+        runCatching {
+            audioRecord?.let { recorder ->
+                if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    recorder.stop()
+                }
+            }
+        }
+        runCatching { audioRecord?.release() }
         audioRecord = null
-        vadDetector.close()
+        runCatching { vadDetector.close() }
     }
 }
